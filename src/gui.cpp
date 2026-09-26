@@ -99,10 +99,12 @@ namespace
 		EnableWindow(g_hRefresh, !Busy);
 		EnableWindow(g_hUpdate, !Busy);
 		EnableWindow(g_hCancel, Busy);
+		SendMessageW(g_hProgress, PBM_SETMARQUEE, FALSE, 0);   // 每轮都从"确定式"开始
 		if(Busy)
 		{
 			g_CancelFlag = false;
 			SendMessageW(g_hProgress, PBM_SETRANGE32, 0, 100);
+			SendMessageW(g_hProgress, PBM_SETMARQUEE, FALSE, 0);   // 默认确定式（有 PBS_MARQUEE 风格才能切）
 			SendMessageW(g_hProgress, PBM_SETPOS, 0, 0);
 			SetWindowTextW(g_hProgText, L"");
 		}
@@ -482,7 +484,7 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		g_hCancel = CreateWindowW(L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_CANCEL, nullptr, nullptr);
 		g_hUpdate = CreateWindowW(L"BUTTON", L"检查更新", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_UPDATE, nullptr, nullptr);
 		g_hOpenDir = CreateWindowW(L"BUTTON", L"打开安装目录", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_OPENDIR, nullptr, nullptr);
-		g_hProgress = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_PROGRESS, nullptr, nullptr);
+		g_hProgress = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE | PBS_MARQUEE, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_PROGRESS, nullptr, nullptr);
 		g_hProgText = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS, 0, 0, 0, 0, H, nullptr, nullptr, nullptr);
 		g_hLog = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
 		g_hStatus = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_STATUS, nullptr, nullptr);
@@ -610,7 +612,16 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		return 0;
 	case WM_APP_PROGRESS: {
 		std::unique_ptr<std::string> P((std::string *)L);
-		SendMessageW(g_hProgress, PBM_SETPOS, (WPARAM)W, 0);
+		if((int)W < 0)
+		{
+			// 百分比未知的长步骤（如编译）：用滚动条明确表示"在干活"，而不是让进度条僵住
+			SendMessageW(g_hProgress, PBM_SETMARQUEE, TRUE, 0);
+		}
+		else
+		{
+			SendMessageW(g_hProgress, PBM_SETMARQUEE, FALSE, 0);
+			SendMessageW(g_hProgress, PBM_SETPOS, (WPARAM)W, 0);
+		}
 		SetWindowTextW(g_hProgText, Utf8ToWide(*P).c_str());
 		return 0;
 	}

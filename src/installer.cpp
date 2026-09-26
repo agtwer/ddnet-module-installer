@@ -4,6 +4,8 @@
 #include <windows.h>
 
 #include <chrono>
+#include <cctype>
+#include <cstring>
 #include <sstream>
 
 namespace
@@ -26,6 +28,9 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		if(Log)
 			Log(LogLevel::Step, "[" + std::to_string(N) + "] " + S);
 	};
+	// 子进程输出：先给"进度识别器"过一遍（git 的进度行 / 编译文件名行会被转成状态行），
+	// 认领了就不要再原样刷日志（git 每 0.2s 刷一次，日志会爆）。
+	std::function<bool(const std::string &)> HandleProcLine;
 	auto Do = [&](const std::string &Exe, const std::vector<std::string> &Args, const std::string &Dir) {
 		if(Log)
 		{
@@ -35,6 +40,8 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			Log(LogLevel::Raw, Cmd);
 		}
 		return RunProcess(Exe, Args, Dir, [&](const std::string &Line) {
+			if(HandleProcLine && HandleProcLine(Line))
+				return;
 			if(Log)
 				Log(LogLevel::Raw, "  " + Line);
 		}, pCancel);
@@ -77,12 +84,126 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		}
 		return false;
 	};
-	// 进度：百分比 + 一行状态（状态里带地址/速度）
+	// 进度：百分比 + 一行状态（状态里带地址/速度）；Pct<0 表示"百分比未知"→ 进度条改滚动
 	auto Report = [&](int Pct, const std::string &S) {
 		if(Progress)
-			Progress(Pct < 0 ? 0 : (Pct > 100 ? 100 : Pct), S);
+			Progress(Pct < 0 ? -1 : (Pct > 100 ? 100 : Pct), S);
 		if(Log)
 			Log(LogLevel::Raw, "  " + S);
+	};
+
+	// ---- 把 git 的实时进度映射到进度条 --------------------------------------
+	// git 在管道下默认不打进度，所以调用处都要加 --progress；输出形如：
+	//   Receiving objects:  45% (1234/2743), 12.34 MiB | 5.67 MiB/s
+	//   Resolving deltas: 100% (200/200), done.
+	struct GitProgT
+	{
+		int Base = 0, Span = 0;          // 映射到 [Base, Base+Span]
+		std::string What;                // "下载源码" / "初始化子模块"
+		std::chrono::steady_clock::time_point LastUi = std::chrono::steady_clock::now();
+		bool Active() const { return Span > 0; }
+	} Gp;
+	int Compiled = 0;
+	bool InCompile = false;
+	std::chrono::steady_clock::time_point CompileT0 = std::chrono::steady_clock::now();
+
+	HandleProcLine = [&](const std::string &Line) -> bool {
+		if(Gp.Active())
+		{
+			const size_t PctPos = Line.find('%');
+			if(PctPos != std::string::npos && PctPos > 0 && isdigit((unsigned char)Line[PctPos - 1]))
+			{
+				int P = 0;
+				{
+					size_t A = PctPos;
+					while(A > 0 && isdigit((unsigned char)Line[A - 1]))
+						--A;
+					P = atoi(Line.substr(A, PctPos - A).c_str());
+					if(P < 0)
+						P = 0;
+					if(P > 100)
+						P = 100;
+				}
+				std::string Speed;
+				const size_t Bar = Line.find('|');
+				if(Bar != std::string::npos)
+				{
+					const size_t S = Line.find_first_not_of(" \t", Bar + 1);
+					if(S != std::string::npos)
+					{
+						const size_t E = Line.find_first_of(",;", S);
+						Speed = Line.substr(S, E == std::string::npos ? std::string::npos : E - S);
+						// git 会把速度字段补空格对齐，去掉首尾空白
+						const size_t A2 = Speed.find_first_not_of(" \t");
+						const size_t E2 = Speed.find_last_not_of(" \t");
+						Speed = (A2 == std::string::npos) ? "" : Speed.substr(A2, E2 - A2 + 1);
+					}
+				}
+				auto Now = std::chrono::steady_clock::now();
+				if(std::chrono::duration<double>(Now - Gp.LastUi).count() < 0.4)
+					return true;   // 认领这行，但节流到 ~2.5 次/秒再刷新界面
+				Gp.LastUi = Now;
+				const int Overall = Gp.Base + Gp.Span * P / 100;
+				char Buf[256];
+				if(!Speed.empty())
+					snprintf(Buf, sizeof(Buf), "%s：%d%% · %s · 整体 %d%%", Gp.What.c_str(), P, Speed.c_str(), Overall);
+				else
+					snprintf(Buf, sizeof(Buf), "%s：%d%% · 整体 %d%%", Gp.What.c_str(), P, Overall);
+				Report(Overall, Buf);
+				return true;
+			}
+			return false;
+		}
+		if(InCompile)
+		{
+			// MSBuild 每编译一个文件会单独打一行文件名（如 "  custom_background.cpp"）：
+			// 编译没有可靠的百分比，就用"已编译 N 个文件 + 已用时间"+滚动的进度条，避免看起来卡死。
+			const size_t Dot = Line.find_last_of('.');
+			if(Dot == std::string::npos || Line.find(' ') != std::string::npos || Line.find('\t') != std::string::npos)
+				return false;
+			const std::string Ext = Line.substr(Dot);
+			if(Ext != ".cpp" && Ext != ".c" && Ext != ".cc" && Ext != ".cxx")
+				return false;
+			++Compiled;
+			auto Now = std::chrono::steady_clock::now();
+			if(std::chrono::duration<double>(Now - Gp.LastUi).count() < 0.5)
+				return true;
+			Gp.LastUi = Now;
+			const int Sec = (int)std::chrono::duration<double>(Now - CompileT0).count();
+			char Buf[256];
+			snprintf(Buf, sizeof(Buf), "编译 game-client：已编译 %d 个文件 · 已用 %d:%02d（编译没有百分比，进度条滚动＝在跑）",
+				Compiled, Sec / 60, Sec % 60);
+			Report(-1, Buf);
+			return true;
+		}
+		return false;
+	};
+
+	// 源码目录是否"完整可用"：只看 .git 存在是不够的。
+	// 下载中途被取消会留下 HEAD=refs/heads/.invalid、没有 index 的残缺树，
+	// 之后 `git apply --3way` 会对每个文件打印 "does not exist in index"，
+	// **却仍然返回退出码 0**、什么都不写 —— 补丁会静默不落地，最后报成"基线不匹配"。
+	// 另外：若 exe 所在目录被别的 git 仓库包住，git 会往上找仓库，这里一并挡掉。
+	auto TreeUsable = [&](const std::string &Dir) {
+		if(!PathExists(JoinPath(Dir, ".git")))
+			return false;
+		if(!RunProcess(Opt.GitPath, {"rev-parse", "--verify", "--quiet", "HEAD"}, Dir, nullptr, nullptr).Ok())
+			return false;
+		ProcessResult T = RunProcess(Opt.GitPath, {"rev-parse", "--show-toplevel"}, Dir, nullptr, nullptr);
+		if(!T.Ok())
+			return false;
+		std::string Top = T.Output, Want = Dir;
+		while(!Top.empty() && (Top.back() == '\n' || Top.back() == '\r' || Top.back() == ' '))
+			Top.pop_back();
+		for(char &C : Top)
+			if(C == '\\')
+				C = '/';
+		for(char &C : Want)
+			if(C == '\\')
+				C = '/';
+		while(!Want.empty() && Want.back() == '/')
+			Want.pop_back();
+		return _stricmp(Top.c_str(), Want.c_str()) == 0;
 	};
 
 	if(Opt.Version.Ref.empty())
@@ -175,14 +296,23 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		}
 	std::string RepoUrl = "https://github.com/" + Opt.Source.Repo + ".git";
 	std::string CloneUrl = Net.ApplyMirror(RepoUrl);
-	bool HaveTree = PathExists(JoinPath(Tree, ".git"));
+	bool HaveTree = TreeUsable(Tree);
 	if(HaveTree)
 	{
-		LogAt(LogLevel::Info, "  已存在源码目录，跳过克隆（如需换版本请删除该目录）");
+		LogAt(LogLevel::Info, "  已存在完整源码目录，跳过克隆（如需换版本请删除该目录）");
 	}
 	else
 	{
-		ProcessResult R = Do(Opt.GitPath, WithNet({"clone", "--depth", "1", "--branch", Opt.Version.Ref, CloneUrl, Tree}), "");
+		if(PathExists(Tree))
+		{
+			LogAt(LogLevel::Warn, "  上次中断留下的源码目录不完整（HEAD 无效或不是独立的 git 仓库），已删除并重新克隆");
+			RemoveTree(Tree);
+		}
+		Gp.Base = 5;
+		Gp.Span = 10;
+		Gp.What = "下载源码";
+		Gp.LastUi = std::chrono::steady_clock::now();
+		ProcessResult R = Do(Opt.GitPath, WithNet({"clone", "--progress", "--depth", "1", "--branch", Opt.Version.Ref, CloneUrl, Tree}), "");
 		if(!R.Ok() && Cancelled())
 		{
 			CleanupPartial();
@@ -195,7 +325,7 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			LogAt(LogLevel::Warn, "  克隆失败，而本次勾了代理 " + Opt.Proxy + " —— 若代理软件没开请先启动；现在先关掉代理重试一次");
 			GitProxy = false;
 			RemoveTree(Tree);
-			R = Do(Opt.GitPath, WithNet({"clone", "--depth", "1", "--branch", Opt.Version.Ref, CloneUrl, Tree}), "");
+			R = Do(Opt.GitPath, WithNet({"clone", "--progress", "--depth", "1", "--branch", Opt.Version.Ref, CloneUrl, Tree}), "");
 		}
 		if(!R.Ok())
 		{
@@ -207,7 +337,7 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 				return false;
 			}
 			if(!Do(Opt.GitPath, {"init", "-q", "."}, Tree).Ok() || !Do(Opt.GitPath, {"remote", "add", "origin", CloneUrl}, Tree).Ok() ||
-				!Do(Opt.GitPath, WithNet({"fetch", "--depth", "1", "origin", Opt.Version.Ref}), Tree).Ok() ||
+				!Do(Opt.GitPath, WithNet({"fetch", "--progress", "--depth", "1", "origin", Opt.Version.Ref}), Tree).Ok() ||
 				!Do(Opt.GitPath, {"checkout", "-q", "-B", "installer", "FETCH_HEAD"}, Tree).Ok())
 			{
 				CleanupPartial();
@@ -218,6 +348,7 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			}
 		}
 	}
+	Gp.Span = 0;   // 源码阶段结束
 	LogAt(LogLevel::Info, "  源码: " + Tree);
 	Report(15, "源码就绪：" + Tree);
 	if(CheckCancel())
@@ -231,18 +362,23 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 	{
 		Step(3, "初始化子模块（ddnet-libs，约 580MB，走镜像会快一些）");
 		Report(18, "初始化子模块 ddnet-libs（约 580MB，可能较慢）");
+		Gp.Base = 18;
+		Gp.Span = 12;
+		Gp.What = "下载子模块 ddnet-libs";
+		Gp.LastUi = std::chrono::steady_clock::now();
 		if(CheckCancel())
 			{
 				CleanupPartial();
 				return false;
 			}
-		ProcessResult R = Do(Opt.GitPath, WithNet({"submodule", "update", "--init", "--recursive"}), Tree);
+		ProcessResult R = Do(Opt.GitPath, WithNet({"submodule", "update", "--progress", "--init", "--recursive"}), Tree);
 		if(!R.Ok())
 		{
 			CleanupPartial();
 			Error = Cancelled() ? "用户已取消（本次下载已自动清理）" : "子模块初始化失败";
 			return false;
 		}
+		Gp.Span = 0;   // 子模块阶段结束
 		Report(30, "子模块就绪");
 	}
 	else
@@ -263,6 +399,13 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			}
 		if(M.Type == "source-patch")
 		{
+			if(!TreeUsable(Tree))
+			{
+				LogAt(LogLevel::Warn, "  源码目录不是完整可用的 git 检出（下载可能被中断）——已删除，再点一次「开始安装」会重新克隆");
+				RemoveTree(Tree);
+				Error = "源码目录不完整，已清理；请再点一次「开始安装」重新克隆";
+				return false;
+			}
 			std::string PatchPath = M.PatchPath;   // .dmod 已解开时是绝对路径
 			if(PatchPath.empty() && !M.PatchLocal.empty())
 			{
@@ -309,7 +452,7 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			if(!M.VerifyPath.empty() && !PathExists(JoinPath(Tree, M.VerifyPath)))
 			{
 				LogAt(LogLevel::Warn, "  校验失败：补丁声称会产生 " + M.VerifyPath + "，但文件不存在");
-				Error = "模块 " + M.Id + " 校验失败（基线不匹配？）";
+				Error = "模块 " + M.Id + " 校验失败：补丁没落地（源码目录不完整，或模块与这个游戏版本的基线不匹配）";
 				return false;
 			}
 			LogAt(LogLevel::Info, "  模块已应用并校验通过");
@@ -479,7 +622,11 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 				return false;
 			}
 		Step(StepNo++, "编译 game-client（耗时较长，请耐心）");
-		Report(85, "编译 game-client（耗时较长；按「取消」会终止编译器）");
+		Compiled = 0;
+		CompileT0 = std::chrono::steady_clock::now();
+		Gp.LastUi = CompileT0;
+		InCompile = true;
+		Report(-1, "编译 game-client：开始编译（编译没有百分比 → 进度条滚动表示在跑；按「取消」会终止编译器）");
 		ProcessResult B = Do(Opt.CmakePath, {"--build", "build", "--config", Opt.Config, "--target", "game-client", "--parallel", "4"}, Tree);
 		if(!B.Ok())
 		{
@@ -492,6 +639,7 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			Error = "编译失败（看日志最后几行；常见：缺 Rust/CMake 版本过低）";
 			return false;
 		}
+		InCompile = false;
 		Built = true;
 		Report(94, "编译完成，组装客户端…");
 

@@ -89,13 +89,34 @@ bool RemoveTree(const std::string &P)
 	std::wstring W = Utf8ToWide(P);
 	if(W.empty() || !PathExists(P))
 		return true;
-	// 目录必须为空才能 RemoveDirectoryW，所以用 SHFileOperation 递归删
-	std::wstring Double = W + L'\0';
-	SHFILEOPSTRUCTW Op = {};
-	Op.wFunc = FO_DELETE;
-	Op.pFrom = Double.c_str();
-	Op.fFlags = FOF_NO_UI | FOF_NOCONFIRMATION | FOF_SILENT;
-	return SHFileOperationW(&Op) == 0;
+	// 刚被杀掉的 git 子进程可能还握着 .git 里的文件句柄，
+	// 所以删不掉要重试几次（SHFileOperation 会尽力删一部分），最后再用 rmdir 兜底。
+	for(int Attempt = 0; Attempt < 5; ++Attempt)
+	{
+		std::wstring Double = W + L'\0';
+		SHFILEOPSTRUCTW Op = {};
+		Op.wFunc = FO_DELETE;
+		Op.pFrom = Double.c_str();
+		Op.fFlags = FOF_NO_UI | FOF_NOCONFIRMATION | FOF_SILENT;
+		if(SHFileOperationW(&Op) == 0 && !PathExists(P))
+			return true;
+		Sleep(300 + 400 * Attempt);
+	}
+	{
+		std::wstring Cmd = L"cmd.exe /c rmdir /s /q \"" + W + L"\"";
+		std::wstring Mutable = Cmd;
+		STARTUPINFOW Si = {sizeof(Si)};
+		Si.dwFlags = STARTF_USESHOWWINDOW;
+		Si.wShowWindow = SW_HIDE;
+		PROCESS_INFORMATION Pi = {};
+		if(CreateProcessW(nullptr, &Mutable[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &Si, &Pi))
+		{
+			WaitForSingleObject(Pi.hProcess, 15000);
+			CloseHandle(Pi.hProcess);
+			CloseHandle(Pi.hThread);
+		}
+	}
+	return !PathExists(P);
 }
 
 bool CopyTree(const std::string &From, const std::string &To, std::string &Error)
@@ -169,6 +190,22 @@ ProcessResult RunProcess(const std::string &Exe, const std::vector<std::string> 
 	}
 	CloseHandle(Wr);
 
+	// 用 Job Object 包住子进程：取消时连它的子进程（git 会派生 git-remote-https /
+	// git-index-pack 等）一起收掉。否则爷爷进程被杀、孙子还活着握着 .git 里的句柄，
+	// 清理就会报"删除失败（被占用）"。失败也不影响主流程（只是少一层保险）。
+	HANDLE Job = CreateJobObjectW(nullptr, nullptr);
+	if(Job)
+	{
+		JOBOBJECT_EXTENDED_LIMIT_INFORMATION Jeli = {};
+		Jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+		SetInformationJobObject(Job, JobObjectExtendedLimitInformation, &Jeli, sizeof(Jeli));
+		if(!AssignProcessToJobObject(Job, Pi.hProcess))
+		{
+			CloseHandle(Job);
+			Job = nullptr;
+		}
+	}
+
 	std::string Pending;
 	char Buf[4096];
 	DWORD Read = 0;
@@ -177,6 +214,21 @@ ProcessResult RunProcess(const std::string &Exe, const std::vector<std::string> 
 	{
 		if(pCancel && pCancel->load())
 		{
+			// 先按**进程树**杀：git 会派生 git-remote-https / index-pack 等孙子进程，
+			// 只 TerminateProcess 直接子进程的话，孙子会继续活着并握着 .git 里的文件句柄，
+			// 结果就是"取消后清理删不掉"。taskkill /T 会顺着父子关系整棵收掉。
+			std::wstring Tk = L"taskkill /T /F /PID " + std::to_wstring((unsigned long)Pi.dwProcessId);
+			std::wstring TkMutable = Tk;
+			STARTUPINFOW Si2 = {sizeof(Si2)};
+			Si2.dwFlags = STARTF_USESHOWWINDOW;
+			Si2.wShowWindow = SW_HIDE;
+			PROCESS_INFORMATION Pi2 = {};
+			if(CreateProcessW(nullptr, &TkMutable[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &Si2, &Pi2))
+			{
+				WaitForSingleObject(Pi2.hProcess, 8000);
+				CloseHandle(Pi2.hProcess);
+				CloseHandle(Pi2.hThread);
+			}
 			TerminateProcess(Pi.hProcess, 1);
 			Killed = true;
 			if(OnLine)
@@ -207,13 +259,20 @@ ProcessResult RunProcess(const std::string &Exe, const std::vector<std::string> 
 				break;
 		}
 		Pending.append(Buf, Read);
-		size_t Pos;
-		while((Pos = Pending.find('\n')) != std::string::npos)
+		// git 的进度行是 \r 结尾（不是 \n）：两种都必须当行结束，
+		// 否则进度全被攒在缓冲区里，界面上看起来就是"卡住不动"。
+		for(;;)
 		{
+			size_t Pos = Pending.find_first_of("\r\n");
+			if(Pos == std::string::npos)
+				break;
 			std::string Line = Pending.substr(0, Pos);
-			Pending.erase(0, Pos + 1);
-			if(!Line.empty() && Line.back() == '\r')
-				Line.pop_back();
+			size_t Skip = 1;
+			if(Pending[Pos] == '\r' && Pos + 1 < Pending.size() && Pending[Pos + 1] == '\n')
+				Skip = 2;   // CRLF 算一个换行
+			Pending.erase(0, Pos + Skip);
+			if(Line.empty())
+				continue;
 			R.Output += Line + "\n";
 			if(OnLine)
 				OnLine(Line);
@@ -232,6 +291,8 @@ ProcessResult RunProcess(const std::string &Exe, const std::vector<std::string> 
 	CloseHandle(Pi.hProcess);
 	CloseHandle(Pi.hThread);
 	CloseHandle(Rd);
+	if(Job)
+		CloseHandle(Job);   // KILL_ON_JOB_CLOSE：顺手把还活着的孙子进程收掉
 	return R;
 }
 
