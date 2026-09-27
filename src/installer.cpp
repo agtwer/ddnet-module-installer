@@ -721,6 +721,15 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 					}
 				}
 			}
+			// 标记文件可能被外部操作弄丢（手工删过、跑过补丁导出脚本等），但模块其实还在这棵树里。
+			// 这时若模块的校验文件已经存在，就按「已应用」处理——否则会往已打过补丁的树上再叠一层，
+			// 大面积 .rej 看起来像"模块没适配这个版本"，把真正的原因（状态不一致）掩盖掉。
+			if(!SkipPatch && !M.VerifyPath.empty() && PathExists(JoinPath(Tree, M.VerifyPath)))
+			{
+				SkipPatch = true;
+				LogAt(LogLevel::Warn, "  没有 .dmod-applied-" + M.Id + ".txt 标记，但模块的校验文件 " + M.VerifyPath
+					+ " 已经在树里——按已应用处理（跳过打补丁）。要重打请删掉它，或点「清理缓存」后重装。");
+			}
 			if(!SkipPatch)
 			{
 			// 多基线补丁：先按"来源id@版本"精确匹配（同一上游有多个适配版本时用），
@@ -815,16 +824,26 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 				}
 				else
 				{
-					// 有 hunk 没套上 = 这个模块大概率没适配当前所选的版本。
-					// 以前这里只打个警告就继续往下编译，结果编译报"缺 Rust/CMake"之类的误导错误。
-					// 现在直接中止，并把"模块 ↔ 版本"这个真实原因说清楚。
+					// 有 hunk 没套上的真实原因有两类，必须分开说；**绝不能把"刚失败的版本"混进"已适配"列表**，
+					// 那会读起来自相矛盾（用户就撞到过：日志先说"使用 20.1 专用补丁"，紧接着说"没有适配 20.1…
+					// 该模块已适配：…、ddnet@20.1"）。两类原因：
+					//   ①这棵树里已经有这个模块（标记丢失，或上次失败留下了半套补丁）
+					//   ②当前源码版本确实不是模块适配的版本
 					LogAt(LogLevel::Error, "  有 " + std::to_string(RejCount) + " 处补丁没套上（首个：" + FirstRej + "）");
+					const bool LooksApplied = !M.VerifyPath.empty() && PathExists(JoinPath(Tree, M.VerifyPath));
 					std::string Sup;
 					for(size_t k = 0; k < M.SupportedVersions.size(); ++k)
 						Sup += (k ? "、" : "") + M.SupportedVersions[k];
-					Error = "模块 " + M.Id + " 没有适配 " + Opt.Source.Name + " " + Opt.Version.Ref
-						+ "（补丁有 " + std::to_string(RejCount) + " 处套不上，已中止，不会继续编译）"
-						+ (Sup.empty() ? std::string("") : ("；该模块已适配：" + Sup));
+					Error = "模块 " + M.Id + " 的补丁与这棵源码树不匹配（" + std::to_string(RejCount) + " 处套不上，已中止，不会继续编译）。"
+						+ (LooksApplied
+							? ("这棵树里已经有模块的文件（" + M.VerifyPath + "），像是已打过补丁却缺少 .dmod-applied 标记。")
+							: std::string("当前源码版本可能不是这个模块适配的版本。"))
+						+ (Sup.empty() ? std::string("") : (" 该模块适配的版本参考：" + Sup))
+						+ " 已把半套补丁清干净（还原受控文件、删掉补丁新增的文件与 .rej），可以直接重试。";
+					// 半套补丁（部分 hunk 已应用 + .rej + 新增文件）会污染后续编译，也害得下次安装继续失败：
+					// checkout 还原被改动的受控文件，clean 掉补丁新增的文件与 .rej（build 缓存属忽略项，不受影响）。
+					Do(Opt.GitPath, {"checkout", "--", "."}, Tree);
+					Do(Opt.GitPath, {"clean", "-fdq"}, Tree);
 					return false;
 				}
 				if(!A2.Ok() && PathExists(JoinPath(Tree, "CMakeLists.txt")) == false)
