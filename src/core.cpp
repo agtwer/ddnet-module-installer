@@ -360,6 +360,8 @@ ProcessResult RunProcess(const std::string &Exe, const std::vector<std::string> 
 	char Buf[4096];
 	DWORD Read = 0;
 	bool Killed = false;
+	// 最近一次收到子进程输出的时刻（用于"仍在进行"心跳）
+	std::chrono::steady_clock::time_point LastOut = std::chrono::steady_clock::now();
 	while(true)
 	{
 		if(pCancel && pCancel->load())
@@ -399,6 +401,20 @@ ProcessResult RunProcess(const std::string &Exe, const std::vector<std::string> 
 			else
 			{
 				Sleep(50);
+				// 长时间没有任何输出时定期报一句"仍在进行"。
+				// 用户实测：ddnet-libs 还在下载，但 git 一段时间不打任何进度 → 日志和界面
+				// 看起来像卡死，人就以为出问题了。这里每 15 秒说明一次"进程还在跑"。
+				const double IdleSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - LastOut).count();
+				if(IdleSec >= 15.0)
+				{
+					LastOut = std::chrono::steady_clock::now();
+					if(OnLine)
+					{
+						char Hb[256];
+						snprintf(Hb, sizeof(Hb), "  [i] 仍在进行：已 %.0f 秒没有新输出（进程仍在运行，没有卡死；网络慢时属正常）", IdleSec);
+						OnLine(Hb);
+					}
+				}
 				continue;
 			}
 		}
@@ -409,6 +425,7 @@ ProcessResult RunProcess(const std::string &Exe, const std::vector<std::string> 
 				break;
 		}
 		Pending.append(Buf, Read);
+		LastOut = std::chrono::steady_clock::now();   // 有输出 → 重置心跳计时
 		// git 的进度行是 \r 结尾（不是 \n）：两种都必须当行结束，
 		// 否则进度全被攒在缓冲区里，界面上看起来就是"卡住不动"。
 		for(;;)
@@ -1475,9 +1492,178 @@ bool InstallState::Save(const std::string &Path, const InstallState &In)
 }
 
 // =============================================================== github ======
+// ---------------------------------------------------------------- 版本号规范化 --
+// 用户硬要求：**无论走哪条数据源（git / releases API / tags API），拉到的版本列表必须一样，
+// 且最新版排在最上面**。所以所有来源都必须经过同一套"过滤 + 排序"。
+namespace
+{
+	struct VerKeyT
+	{
+		std::vector<int> Parts;   // 20.1 -> {20,1}
+		bool Prefixed = false;    // 标签带 v/V 前缀（fork 自己的发布常用这种写法）
+		bool IsRc = false;
+		int Rc = 0;
+		bool Ok = false;          // false = 不是版本号样式，应从列表剔除
+	};
+
+	// 认识这些：20.1 / 19.9 / 0.6.0 / V10.9.0 / v10.9.0 / 20.1-rc2
+	// 其余（pr-xxx、xxx-headless、languageadd_german1、0.6.0-release…）一律不算版本号。
+	VerKeyT ParseVerKey(const std::string &Tag)
+	{
+		VerKeyT K;
+		std::string S = Tag;
+		if(!S.empty() && (S[0] == 'v' || S[0] == 'V'))
+		{
+			K.Prefixed = true;
+			S = S.substr(1);
+		}
+		const size_t Dash = S.find('-');
+		if(Dash != std::string::npos)
+		{
+			const std::string Suf = S.substr(Dash + 1);
+			if(Suf.rfind("rc", 0) != 0 || Suf.size() < 3)
+				return K;
+			for(size_t i = 2; i < Suf.size(); ++i)
+				if(!isdigit((unsigned char)Suf[i]))
+					return K;
+			K.IsRc = true;
+			K.Rc = atoi(Suf.substr(2).c_str());
+			S = S.substr(0, Dash);
+		}
+		if(S.empty())
+			return K;
+		size_t i = 0;
+		while(i < S.size())
+		{
+			const size_t B = i;
+			while(i < S.size() && isdigit((unsigned char)S[i]))
+				++i;
+			if(i == B)
+				return K;
+			K.Parts.push_back(atoi(S.substr(B, i - B).c_str()));
+			if(i < S.size())
+			{
+				if(S[i] != '.')
+					return K;
+				++i;
+				if(i >= S.size())
+					return K;   // 结尾是点
+			}
+		}
+		if(K.Parts.size() < 2)
+			return K;               // 至少要 x.y
+		K.Ok = true;
+		return K;
+	}
+
+	// 从新到旧：先比版本号数值；同数值时正式版在 rc 之前；都是 rc 则 rc 号大的在前。
+	bool VerNewer(const std::string &A, const std::string &B)
+	{
+		const VerKeyT Ka = ParseVerKey(A), Kb = ParseVerKey(B);
+		if(Ka.Parts != Kb.Parts)
+			return Ka.Parts > Kb.Parts;
+		if(Ka.IsRc != Kb.IsRc)
+			return !Ka.IsRc;
+		if(Ka.IsRc && Ka.Rc != Kb.Rc)
+			return Ka.Rc > Kb.Rc;
+		return false;
+	}
+
+	// 统一规范化：剔除不是版本号的 → （按开关）剔除测试版 → 去重 → 按版本号从新到旧
+	void NormalizeVersions(std::vector<GameVersion> &V, bool IncludePrerelease)
+	{
+		std::vector<GameVersion> Keep;
+		for(const auto &X : V)
+		{
+			const VerKeyT K = ParseVerKey(X.Tag);
+			if(!K.Ok)
+				continue;                                   // 不是版本号样式（pr-*、*-headless 等）
+			if(!IncludePrerelease && (K.IsRc || X.Prerelease))
+				continue;                                   // 关闭"测试版"时只留正式版
+			Keep.push_back(X);
+		}
+		std::stable_sort(Keep.begin(), Keep.end(), [](const GameVersion &A, const GameVersion &B) {
+			const VerKeyT Ka = ParseVerKey(A.Tag), Kb = ParseVerKey(B.Tag);
+			// 同一个仓库里若"带 v/V 前缀"和"不带前缀"两套编号都有，通常前者是它自己的发布、
+			// 后者是从上游继承来的标签（TClient 就是：V10.9.0 是它的正式版，0.x~16.x 是继承的）。
+			// 让前缀那组排在前面，否则它自己的最新版会被埋到很下面。
+			// 只有一套编号的仓库（如 DDNet 全是不带前缀的）此条不产生任何影响。
+			if(Ka.Prefixed != Kb.Prefixed)
+				return Ka.Prefixed;
+			if(VerNewer(A.Tag, B.Tag))
+				return true;
+			if(VerNewer(B.Tag, A.Tag))
+				return false;
+			return false;
+		});
+		std::vector<std::string> Seen;
+		std::vector<GameVersion> Uniq;
+		for(const auto &X : Keep)
+		{
+			bool Dup = false;
+			for(const auto &S : Seen)
+				if(S == X.Tag) { Dup = true; break; }
+			if(!Dup)
+			{
+				Seen.push_back(X.Tag);
+				Uniq.push_back(X);
+			}
+		}
+		V.swap(Uniq);
+	}
+}
+
 bool Installer::FetchVersions(const GameSource &Src, std::vector<GameVersion> &Out, std::string &Error)
 {
 	Out.clear();
+	// ① 首选 git：一次拿全所有标签、不消耗 API 配额，而且与"镜像/代理哪条路通"无关 ——
+	//    这是让"无论怎么做列表都一样"成立的根基。API 只在 git 拿不到时才用。
+	auto TryGitTags = [&]() {
+		std::vector<std::string> GitArgs = {"-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=45"};
+		if(!Net.MirrorPrefix.empty())
+			GitArgs.insert(GitArgs.end(), {"-c", "url." + Net.MirrorPrefix + "https://github.com/.insteadOf=https://github.com/"});
+		if(!Net.Proxy.empty() && !Net.Direct)
+			GitArgs.insert(GitArgs.end(), {"-c", "http.proxy=http://" + Net.Proxy, "-c", "https.proxy=http://" + Net.Proxy});
+		GitArgs.push_back("ls-remote");
+		GitArgs.push_back("--tags");
+		GitArgs.push_back("--refs");
+		GitArgs.push_back("https://github.com/" + Src.Repo + ".git");
+		if(Log)
+			Log(LogLevel::Info, "  用 git 读取全部标签（不消耗 API 配额）…");
+		ProcessResult G = RunProcess("git", GitArgs, "", nullptr);
+		if(!G.Ok())
+		{
+			if(Log)
+				Log(LogLevel::Warn, "  git 读取标签失败（退出码 " + std::to_string(G.ExitCode) + "），改用 API");
+			return;
+		}
+		// 每行形如：<sha>\trefs/tags/<tag>
+		std::istringstream Is(G.Output);
+		std::string Line;
+		while(std::getline(Is, Line))
+		{
+			while(!Line.empty() && (Line.back() == '\r' || Line.back() == ' ' || Line.back() == '\t'))
+				Line.pop_back();
+			const size_t Tab = Line.find('\t');
+			if(Tab == std::string::npos)
+				continue;
+			const std::string RefName = Line.substr(Tab + 1);
+			const std::string Prefix = "refs/tags/";
+			if(RefName.rfind(Prefix, 0) != 0)
+				continue;
+			const std::string Tag = RefName.substr(Prefix.size());
+			if(Tag.empty() || Tag.find("^{}") != std::string::npos)
+				continue;
+			GameVersion V;
+			V.Tag = Tag;
+			V.Name = Tag;
+			V.Ref = Tag;
+			Out.push_back(V);
+		}
+		if(Log)
+			Log(LogLevel::Info, "  git 读到 " + std::to_string(Out.size()) + " 个标签");
+	};
+	TryGitTags();
 	// 拿着接口一路退到"真正绕过代理的直连"：
 	//  ① 按界面设置（可能同时带镜像/代理；两者都没勾 = 跟随 Windows 系统代理）
 	//  ② 镜像不支持 api.github.com（ghproxy.net 会 403）→ 去掉镜像再试
@@ -1522,9 +1708,12 @@ bool Installer::FetchVersions(const GameSource &Src, std::vector<GameVersion> &O
 		}
 		return R;
 	};
-	// 先试 GitHub releases API（含 tag 与时间）；失败再退到 tags
-	std::string Api = "https://api.github.com/repos/" + Src.Repo + "/releases?per_page=30";
-	HttpResult R = ApiGet(Api);
+	// ② git 没拿到才用 API（releases 含 tag 与时间）；失败再退到 tags。
+	//    per_page 提到 100：尽量取全，结果才能与 git 那份保持一致。
+	std::string Api = "https://api.github.com/repos/" + Src.Repo + "/releases?per_page=100";
+	HttpResult R;   // 若 git 已经拿到标签就不打 API：省配额，也避免列表被 API 的部分结果覆盖
+	if(Out.empty())
+		R = ApiGet(Api);
 	if(R.Ok)
 	{
 		JsonValue Root;
@@ -1559,7 +1748,7 @@ bool Installer::FetchVersions(const GameSource &Src, std::vector<GameVersion> &O
 		}
 		else
 		{
-		std::string TagsApi = "https://api.github.com/repos/" + Src.Repo + "/tags?per_page=30";
+		std::string TagsApi = "https://api.github.com/repos/" + Src.Repo + "/tags?per_page=100";
 		HttpResult T = ApiGet(TagsApi);
 		if(!T.Ok)
 		{
@@ -1640,10 +1829,23 @@ bool Installer::FetchVersions(const GameSource &Src, std::vector<GameVersion> &O
 		else if(Log)
 			Log(LogLevel::Warn, "  git 读取标签也失败（" + std::to_string(G.ExitCode) + "）");
 	}
+	// ③ 统一规范化：无论上面走的是 git 还是 API，最终列表都按同一规则过滤 + 排序，
+	//    保证"无论怎么做，拉取到的版本列表一样，且最新版在最上面"。
+	NormalizeVersions(Out, IncludePrerelease);
+	// 透明说明：这个来源的标签里若混着两套编号（自己的发布 + 继承上游的），
+	// 就在日志里说明为什么这么排，免得用户以为列表乱了。
+	{
+		int PrefN = 0, PlainN = 0;
+		for(const auto &X : Out)
+			(ParseVerKey(X.Tag).Prefixed ? PrefN : PlainN)++;
+		if(PrefN > 0 && PlainN > 0 && Log)
+			Log(LogLevel::Info, "  共 " + std::to_string(PrefN) + " 个带 v/V 前缀的版本（该来源自己的发布，已排在前面）与 " +
+						 std::to_string(PlainN) + " 个从上游继承来的版本");
+	}
 	if(Out.empty())
 	{
 		if(Error.empty())
-			Error = "没有拿到任何版本（仓库可能没有 release/tag，或网络被拦）";
+			Error = "没有拿到任何版本（仓库里没有版本号样式的标签，或网络被拦）";
 		return false;
 	}
 	return true;

@@ -16,7 +16,7 @@ enum class LogLevel { Info, Step, Warn, Error, Raw };
 using LogFn = std::function<void(LogLevel, const std::string &)>;
 
 // 程序版本号（安装器自身；模块各自有自己的 tested_on/verified 信息）
-inline const char *kInstallerVersion = "1.6";
+inline const char *kInstallerVersion = "1.7";
 
 // ------------------------------------------------------------------- http ---
 struct HttpResult
@@ -197,6 +197,9 @@ struct Installer
 	std::function<void(int, const std::string &)> Progress;
 	std::atomic<bool> *pCancel = nullptr;   // 置 true 会尽快中断（步骤边界 / 下载中 / 子进程）
 	std::string AppDir;           // 程序所在目录（放模块与清单）
+	// 版本列表是否包含测试版（rc 等）。由界面的"测试版"开关决定：
+	// 开 = 拉取全部版本；关 = 只保留正式版。默认只留正式版。
+	bool IncludePrerelease = false;
 
 	bool FetchVersions(const GameSource &Src, std::vector<GameVersion> &Out, std::string &Error);
 	// 整条流水线；失败返回 false，Error 给原因（日志里已有细节）

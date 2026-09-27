@@ -223,6 +223,19 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 					Gp.BytesPct = Est;
 				P = Gp.BytesPct;
 			}
+			// 即使 git 给了百分比，也和字节估算取较大值：git 在"接收大 pack"阶段可能长时间停在
+			// 同一个数字（用户实测 173 行全是 0%），而字节明明在涨 —— 那样界面看起来像卡死了。
+			if(Gp.BytesDone > 0.0)
+			{
+				const double K = 300.0;
+				int Est = (int)(100.0 * (1.0 - exp(-Gp.BytesDone / K)));
+				if(Est > 96)
+					Est = 96;
+				if(Est > Gp.BytesPct)
+					Gp.BytesPct = Est;
+				if(P < Gp.BytesPct)
+					P = Gp.BytesPct;
+			}
 			if(P < 0)
 				return false;
 
@@ -479,6 +492,23 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		}
 	std::string RepoUrl = "https://github.com/" + Opt.Source.Repo + ".git";
 	std::string CloneUrl = Net.ApplyMirror(RepoUrl);
+	// 克隆前把落点清干净：失败重试时如果上一次留下的目录没删掉（被杀进程还可能握着句柄），
+	// git 会直接报 "destination path ... already exists and is not an empty directory"，
+	// 于是"重试"根本没跑起来。所以这里多重试几次，再用 rmdir /s /q 兜底，并如实记日志。
+	auto CleanCloneDir = [&](const std::string &Path) {
+		if(!PathExists(Path))
+			return true;
+		for(int i = 0; i < 3 && PathExists(Path); ++i)
+			RemoveTree(Path);
+		if(PathExists(Path))
+			Do("cmd", {"/c", "rmdir", "/s", "/q", Path}, "");
+		if(PathExists(Path))
+		{
+			LogAt(LogLevel::Warn, "  清理未完成的下载目录失败（可能有进程占用）：" + Path);
+			return false;
+		}
+		return true;
+	};
 	bool HaveTree = TreeUsable(Tree);
 	if(HaveTree)
 	{
@@ -491,6 +521,7 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			LogAt(LogLevel::Warn, "  上次中断留下的源码目录不完整（HEAD 无效或不是独立的 git 仓库），已删除并重新克隆");
 			RemoveTree(Tree);
 		}
+		CleanCloneDir(CloneTo);
 		Gp.Base = 5;
 		Gp.Span = 10;
 		Gp.What = "下载源码";
@@ -509,7 +540,7 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			// 低速保护触发/传输被掐断：同样的设置重试一次，换新连接往往就过了
 			// （代理软件在运行时直连反而更慢，所以先别降级）。
 			LogAt(LogLevel::Warn, "  克隆中断（多半是代理/网络传输被掐断）——原设置重试一次（换新连接）");
-			RemoveTree(CloneTo);
+			CleanCloneDir(CloneTo);
 			R = Do(Opt.GitPath, WithNet({"clone", "--progress", "--depth", "1", "--branch", Opt.Version.Ref, CloneUrl, CloneTo}), "");
 		}
 		if(!R.Ok() && GitProxy)
@@ -517,12 +548,15 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			// 多半是代理软件没在运行：关掉代理（镜像仍保留）再试一次，别让整个安装白白失败
 			LogAt(LogLevel::Warn, "  克隆仍失败，而本次勾了代理 " + Opt.Proxy + " —— 关掉代理直连重试一次");
 			GitProxy = false;
-			RemoveTree(CloneTo);
+			CleanCloneDir(CloneTo);
 			R = Do(Opt.GitPath, WithNet({"clone", "--progress", "--depth", "1", "--branch", Opt.Version.Ref, CloneUrl, CloneTo}), "");
 		}
 		if(!R.Ok())
 		{
 			LogAt(LogLevel::Warn, "  按 tag/分支浅克隆失败，尝试按提交号抓取…");
+			// 这里把落点也清掉：否则末尾"把 downloading 里的树移到 src"那一步会拿残留的
+			// 半成品覆盖掉刚抓好的树（日志里就出现过 downloading 目录已存在的报错）。
+			CleanCloneDir(CloneTo);
 			RemoveTree(Tree);
 			if(!MakeDirs(Tree))
 			{
@@ -543,7 +577,9 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 	}
 	Gp.Span = 0;   // 源码阶段结束
 	// 克隆成功：把 downloading 里那棵树移到 src（此时才算"已完成的源码"）
-	if(PathExists(CloneTo))
+	// 注意条件：只有当 src 里还没有可用树时才搬 —— "按提交号抓取"是在 src 里直接做的，
+	// 那时若 downloading 还留着半成品，搬过去会把刚抓好的树删掉换成残缺的。
+	if(PathExists(CloneTo) && !TreeUsable(Tree))
 	{
 		RemoveTree(Tree);
 		bool Moved = (MoveFileW(Utf8ToWide(CloneTo).c_str(), Utf8ToWide(Tree).c_str()) != 0);

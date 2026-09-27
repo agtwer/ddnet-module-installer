@@ -22,6 +22,7 @@ namespace
 	const int IDC_CLEAN = 1023, IDC_REFMODS = 1024;   // 一键清理 src\ / 刷新 mods\ 模块列表
 	const int IDC_DEBUGSAVE = 1025;                   // 调试安装：存档放游戏目录的 save 文件夹
 	const int IDC_RELOADLOG = 1026;                   // 刷新日志：重新读 installer.log 铺到日志区
+	const int IDC_PRERELEASE = 1027;                  // 测试版：开=拉取全部版本，关=只保留正式版
 	const int IDC_PROGRESS = 1013, IDC_LOG = 1014, IDC_STATUS = 1015, IDC_UPDATE = 1016;
 	const int IDC_SRCLIST = 1017;
 	const int IDC_MIRRORHOST = 1018, IDC_PROXY = 1019, IDC_PROXYADDR = 1020;
@@ -50,7 +51,7 @@ namespace
 	HWND g_hMirrorHost, g_hProxy, g_hProxyAddr;
 	HWND g_hMt, g_hMtCount;   // 多线程下载
 	HWND g_hBuild, g_hInstall, g_hCancel, g_hOpenDir, g_hProgress, g_hLog, g_hStatus, g_hUpdate;
-	HWND g_hClean, g_hRefMods, g_hDebugSave, g_hReloadLog;
+	HWND g_hClean, g_hRefMods, g_hDebugSave, g_hReloadLog, g_hPrerelease;
 	HWND g_hLabel1, g_hLabel2, g_hLabel3;
 
 	const wchar_t *CHECK = L"\u2714";   // ✔
@@ -564,8 +565,11 @@ namespace
 		SetBusy(true);
 		g_Versions.clear();
 		ApplyNetSettings();
+		// "测试版"开关：开 = 拉取全部版本，关 = 只保留正式版（rc 等测试版不显示）
+		g_Installer.IncludePrerelease = CtlChecked(g_hPrerelease);
 		GameSource S = SelectedSource();
-		LogBridge(LogLevel::Step, "拉取版本信息：" + S.Name + "（" + S.Repo + "；" + NetSummary() + "）");
+		LogBridge(LogLevel::Step, "拉取版本信息：" + S.Name + "（" + S.Repo + "；" + NetSummary() +
+						 "；" + (g_Installer.IncludePrerelease ? "含测试版" : "仅正式版") + "）");
 		std::string Err;
 		bool Ok = g_Installer.FetchVersions(S, g_Versions, Err);
 		if(!Ok)
@@ -579,6 +583,7 @@ namespace
 	{
 		SetBusy(true);
 		ApplyNetSettings();
+		g_Installer.IncludePrerelease = CtlChecked(g_hPrerelease);   // 与"测试版"开关保持一致
 		if(!g_HasState)
 			LogBridge(LogLevel::Warn, "本机还没有安装记录（.ddnet\\debug\\install-state.json），先安装一次再看更新");
 		else
@@ -711,6 +716,7 @@ namespace
 		MoveWindow(g_hDebugSave, LeftX + 122, Y2 + 54, 232, 24, TRUE);   // 调试安装：存档放游戏目录
 		MoveWindow(g_hMt, LeftX + 364, Y2 + 54, 110, 24, TRUE);
 		MoveWindow(g_hMtCount, LeftX + 482, Y2 + 54, 80, 200, TRUE);   // 可编辑下拉：2/4/8/16 或自填
+		MoveWindow(g_hPrerelease, LeftX + 572, Y2 + 54, 190, 24, TRUE);   // 测试版：开=全部版本，关=只正式版
 
 		// 按钮 + 进度
 		int Y3 = Y2 + 94;
@@ -783,6 +789,8 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		g_hDebugSave = CreateWindowW(L"BUTTON", L"调试安装（存档存游戏目录 save\\）", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_DEBUGSAVE, nullptr, nullptr);
 		// 多线程下载（NDM 式）：勾选后用 HTTP Range 分段多连接拉取大文件（FFmpeg 等）
 		g_hMt = CreateWindowW(L"BUTTON", L"多线程下载", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_MT, nullptr, nullptr);
+		// 测试版开关：开 = 版本列表包含 rc 等测试版；关 = 只保留正式版（默认关）
+		g_hPrerelease = CreateWindowW(L"BUTTON", L"测试版（含 rc 等测试版本）", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_PRERELEASE, nullptr, nullptr);
 		g_hMtCount = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | WS_VSCROLL | CBS_AUTOHSCROLL, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_MTCOUNT, nullptr, nullptr);
 		for(const wchar_t *N : {L"2", L"4", L"8", L"16"})
 			SendMessageW(g_hMtCount, CB_ADDSTRING, 0, (LPARAM)N);
@@ -800,7 +808,7 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		g_hLog = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
 		g_hStatus = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_STATUS, nullptr, nullptr);
 
-		for(HWND Ctl : {g_hSource, g_hRefresh, g_hVersions, g_hModules, g_hMirror, g_hMirrorHost, g_hProxy, g_hProxyAddr, g_hBuild, g_hMt, g_hMtCount,
+		for(HWND Ctl : {g_hSource, g_hRefresh, g_hVersions, g_hModules, g_hMirror, g_hMirrorHost, g_hProxy, g_hProxyAddr, g_hBuild, g_hMt, g_hMtCount, g_hPrerelease,
 			     g_hInstall, g_hCancel, g_hUpdate, g_hOpenDir, g_hClean, g_hRefMods, g_hReloadLog, g_hDebugSave, g_hLog, g_hStatus, g_hLabel1, g_hLabel2, g_hLabel3, g_hProgText})
 			SendMessageW(Ctl, WM_SETFONT, (WPARAM)Font, TRUE);
 
@@ -994,6 +1002,17 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		{
 			EnableWindow(g_hMtCount, SendMessageW(g_hMt, BM_GETCHECK, 0, 0) == BST_CHECKED);
 			UpdateHotThreads();   // 热生效：勾/取消多线程立即影响下一个下载
+		}
+		else if(Id == IDC_PRERELEASE && HIWORD(W) == BN_CLICKED)
+		{
+			// 切换"测试版"只影响列表内容 → 立即重新拉一次版本列表，让用户马上看到差别
+			// （g_Busy 期间 StartWorker 会丢弃点击，这与其它按钮一致）
+			const bool On = SendMessageW(g_hPrerelease, BM_GETCHECK, 0, 0) == BST_CHECKED;
+			if(!g_Busy)
+			{
+				AppendLog(On ? "[i] 已开启测试版：版本列表将包含 rc 等测试版本" : "[i] 已关闭测试版：版本列表只保留正式版");
+				StartWorker(WorkerRefresh);
+			}
 		}
 		else if(Id == IDC_MTCOUNT && (HIWORD(W) == CBN_EDITCHANGE || HIWORD(W) == CBN_SELCHANGE))
 			UpdateHotThreads();   // 热生效：安装进行中改线程数（可编辑下拉发 CBN_EDITCHANGE，不是 EN_CHANGE）
