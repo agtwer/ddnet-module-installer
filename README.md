@@ -1,8 +1,9 @@
-# ddnet-module-installer **v1.0**
+# ddnet-module-installer
 
 这是一个 **DDNet 源码拉取编译器**，支持在编译前插入模块以实现自定义功能：选来源与版本 → 自动拉源码 → 套模块补丁 → 编译 → 组装出可直接双击的客户端。
 C++ / Win32 单文件程序，不依赖 Qt、不依赖 .NET，编译出来一个 exe 就能跑。
-**版本**：程序自身版本号 `v1.0`（标题栏、启动日志、状态栏都会显示）；模块各自带 `tested_on` / `verified` 信息，与程序版本无关。
+模块各自带 `tested_on` / `verified` 信息，与程序版本无关。
+**开发模块**：见 **[模块开发文档](MODULE-DEV.md)**。
 
 ## 它做什么
 
@@ -47,6 +48,8 @@ build.bat            :: 自动找 VS 自带 cmake，配置 + 编译
 - `.dmod` 是 zip 容器，内含自描述的 `module.json`（id / name / **version** / type / tested_on / verified / requires / verify_path / patch）+ `patch/module.patch` + 可选的 `files/`（模块源码副本，供手工安装参考）。
 - 模块声明的依赖（例如 `ffmpeg8.1`）**由安装器自动满足**，不再是全局开关。
 - 拖入时同 `id` 的旧版本会被替换；启动与拖入都会重新扫描 `mods\`。
+
+**要自己写模块？** 完整字段说明、补丁生成方式、多基线（DDNet / TClient 各一份补丁）做法与发布前检查清单见 **[模块开发文档](MODULE-DEV.md)**。
 
 ## 已知边界
 
