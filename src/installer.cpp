@@ -575,7 +575,9 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 					{
 						LogAt(LogLevel::Info, "  源码树里是 " + M.Id + " v" + Mark + "，本次装 v" + M.Version + "——先撤销旧补丁");
 						// 旧补丁优先用该来源的专用补丁撤销，撤不掉就整棵树重来（下次会重新克隆）
-						std::string OldPatch = M.Patches.count(Opt.Source.Id) ? M.Patches.at(Opt.Source.Id) : M.PatchPath;
+						// 旧补丁优先用该来源（含版本）的专用补丁撤销，撤不掉就整棵树重来
+						std::string OldPatch = M.Patches.count(Opt.Source.Id + "@" + Opt.Version.Ref) ? M.Patches.at(Opt.Source.Id + "@" + Opt.Version.Ref)
+										 : (M.Patches.count(Opt.Source.Id) ? M.Patches.at(Opt.Source.Id) : M.PatchPath);
 						if(!OldPatch.empty() && PathExists(OldPatch))
 							Do(Opt.GitPath, {"apply", "-R", "--whitespace=nowarn", OldPatch}, Tree);
 						DeleteFileW(Utf8ToWide(MarkPath).c_str());
@@ -584,8 +586,14 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			}
 			if(!SkipPatch)
 			{
-			// 多基线补丁：按本次来源 id 选专用补丁（模块可为 DDNet/TClient 各带一份）。
-			if(M.Patches.count(Opt.Source.Id))
+			// 多基线补丁：先按"来源id@版本"精确匹配（同一上游有多个适配版本时用），
+			// 再退回只按来源 id 的通用补丁；都没有就用默认 patch。
+			if(M.Patches.count(Opt.Source.Id + "@" + Opt.Version.Ref))
+			{
+				PatchPath = M.Patches.at(Opt.Source.Id + "@" + Opt.Version.Ref);
+				LogAt(LogLevel::Info, "  使用 " + Opt.Source.Id + " " + Opt.Version.Ref + " 专用补丁");
+			}
+			else if(M.Patches.count(Opt.Source.Id))
 			{
 				PatchPath = M.Patches.at(Opt.Source.Id);
 				LogAt(LogLevel::Info, "  使用 " + Opt.Source.Id + " 专用补丁（模块为多个上游基线各带了一份）");

@@ -1392,6 +1392,7 @@ bool LoadDmodFile(const std::string &DmodPath, const std::string &TempRoot, Modu
 	Out.BaseHint = Root.GetString("base_hint");
 	Out.DocsUrl = Root.GetString("docs_url");
 	Out.TestedOn = JsonToStringList(Root.GetArray("tested_on"));
+	Out.SupportedVersions = JsonToStringList(Root.GetArray("supported_versions"));
 	Out.Requires = JsonToStringList(Root.GetArray("requires"));
 	if(const JsonValue *Ver = Root.Find("verified"); Ver && Ver->T == JsonValue::Type::Object)
 		for(const auto &KV : Ver->Obj)

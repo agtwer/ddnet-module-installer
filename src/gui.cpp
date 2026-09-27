@@ -313,11 +313,14 @@ namespace
 			std::wstring Ver = Utf8ToWide(M.Version.empty() ? "?" : M.Version);
 			ListView_SetItemText(g_hModules, (int)i, 1, &Ver[0]);
 
-			std::string DescS = M.Description;
-			if(!M.Origin.empty())
-				DescS += "   [" + M.Origin + "]";
-			std::wstring Desc = Utf8ToWide(DescS);
-			ListView_SetItemText(g_hModules, (int)i, 2, &Desc[0]);
+			// 适配版本列：列出该模块做过适配的"来源@版本"；为空则显示"未声明"
+			std::string SupS;
+			for(size_t k = 0; k < M.SupportedVersions.size(); ++k)
+				SupS += (k ? "、" : "") + M.SupportedVersions[k];
+			if(SupS.empty())
+				SupS = "未声明";
+			std::wstring Sup = Utf8ToWide(SupS);
+			ListView_SetItemText(g_hModules, (int)i, 2, &Sup[0]);
 
 			auto Cell = [&](const char *SrcId) {
 				auto It2 = M.Verified.find(SrcId);
@@ -672,7 +675,7 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 			C.pszText = (LPWSTR)L"版本";
 			C.cx = 60;
 			ListView_InsertColumn(g_hModules, 1, &C);
-			C.pszText = (LPWSTR)L"说明";
+			C.pszText = (LPWSTR)L"适配版本";
 			C.cx = 230;
 			ListView_InsertColumn(g_hModules, 2, &C);
 			C.pszText = (LPWSTR)L"DDNet";

@@ -119,6 +119,9 @@ struct ModuleInfo
 	std::string DocsUrl;
 	std::string BaseHint;        // 基线说明（给人看）
 	std::vector<std::string> TestedOn;   // 例如 "TaterClient/TClient@6b4118bf0"
+	// 适配版本：该模块在哪些"来源@版本"上做过适配（module.json 的 supported_versions）。
+	// 形如 {"ddnet@19.9", "tclient@10.9.0"}；只写版本号或来源 id 也接受（宽松匹配）。
+	std::vector<std::string> SupportedVersions;
 	std::vector<std::string> Requires;   // "ffmpeg8.1" / "git" / "cmake" / "msvc"
 	std::map<std::string, bool> Verified; // 按来源 id 的验证状态: {"tclient":true,"ddnet":false}
 	std::string VerifyPath;      // 安装后应存在的相对路径（用于校验）
