@@ -618,6 +618,16 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 				CleanupPartial();
 				return false;
 			}
+		// 子模块失败分两类：
+		//   ①传输被掐断 → 换新连接重试一次即可；
+		//   ②**上次中断留下的残留状态** → 重复同一条命令必然再失败（实测两次都是
+		//     `fatal: Unable to find current revision in submodule path 'ddnet-libs'`）。
+		// 这类必须先清掉子模块的残留（工作区目录 + .git/modules 里的副本）再强制重建。
+		auto RepairSubmodule = [&]() {
+			Do(Opt.GitPath, {"submodule", "deinit", "-f", "ddnet-libs"}, Tree);   // 解除注册（失败也继续）
+			RemoveTree(JoinPath(Tree, "ddnet-libs"));                             // 工作区里的半成品
+			RemoveTree(JoinPath(JoinPath(JoinPath(Tree, ".git"), "modules"), "ddnet-libs"));   // 子模块的 git 副本
+		};
 		ProcessResult R = Do(Opt.GitPath, WithNet({"submodule", "update", "--progress", "--init", "--recursive"}), Tree);
 		if(!R.Ok() && !Cancelled())
 		{
@@ -625,10 +635,25 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			LogAt(LogLevel::Warn, "  子模块初始化中断——原设置重试一次（换新连接）");
 			R = Do(Opt.GitPath, WithNet({"submodule", "update", "--progress", "--init", "--recursive"}), Tree);
 		}
+		if(!R.Ok() && !Cancelled())
+		{
+			LogAt(LogLevel::Warn, "  仍失败——清理子模块残留（上次中断留下的半成品会让它一直失败）后强制重建");
+			RepairSubmodule();
+			R = Do(Opt.GitPath, WithNet({"submodule", "update", "--progress", "--init", "--recursive", "--force"}), Tree);
+		}
+		if(!R.Ok() && !Cancelled())
+		{
+			// 最后再退一步：连同子模块的远端配置一起刷新（换了镜像/代理时注册的 URL 可能已过时）
+			LogAt(LogLevel::Warn, "  依旧失败——同步子模块地址后再完整拉取一次");
+			Do(Opt.GitPath, {"submodule", "sync", "--recursive"}, Tree);
+			RepairSubmodule();
+			R = Do(Opt.GitPath, WithNet({"submodule", "update", "--progress", "--init", "--recursive", "--force", "--depth", "2147483647"}), Tree);
+		}
 		if(!R.Ok())
 		{
 			CleanupPartial();
-			Error = Cancelled() ? "用户已取消（本次下载已自动清理）" : "子模块初始化失败";
+			Error = Cancelled() ? "用户已取消（本次下载已自动清理）" :
+					     "子模块初始化失败（已尝试：重试 / 清理残留重建 / 同步地址完整拉取）";
 			return false;
 		}
 		Gp.Span = 0;   // 子模块阶段结束
