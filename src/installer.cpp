@@ -50,6 +50,9 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 	// GitProxy 会在"代理不可用"时被自动关掉（见下面克隆失败的重试），避免代理没开就整装失败。
 	bool GitProxy = !Opt.Proxy.empty();
 	auto WithNet = [&](std::vector<std::string> Args) {
+		// 低速保护：代理路由不稳时传输会长期停在几 KiB/s（实测两次都卡死在克隆 31%），
+		// git 默认永不超时 → 挂死。低于 1KiB/s 持续 45 秒就让它失败，交给上层重试换新连接。
+		Args.insert(Args.begin(), {"-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=45"});
 		if(!Net.MirrorPrefix.empty())
 			Args.insert(Args.begin(), {"-c", "url." + Net.MirrorPrefix + "https://github.com/.insteadOf=https://github.com/"});
 		if(GitProxy)
@@ -60,9 +63,23 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		}
 		return Args;
 	};
-	// 下载（模块补丁 / FFmpeg）：失败时先怀疑代理不可用/被限流——绕过所有代理直连重试一次
+	// 下载（模块补丁 / FFmpeg）：线程数 >1 时走 HTTP Range 分段多连接（NDM 式），
+	// 不支持分段或分段失败会自动退回单连接；再失败则绕过所有代理直连重试一次。
 	auto Download = [&](const std::string &Url, const std::string &Dest, const std::function<void(int64_t, int64_t)> &Cb) {
-		HttpResult R = Net.DownloadFile(Url, Dest, Cb);
+		auto Note = [&](const std::string &S) { LogAt(LogLevel::Info, S); };
+		// 热线程数：安装进行中在输入框改数字，对下一个开始下载的文件立即生效；
+		// 没有提示值（CLI 自检等场景）就用本次安装的快照
+		int Threads = g_DlThreadsHint.load();
+		if(Threads < 1)
+			Threads = Opt.DownloadThreads;
+		if(Threads < 1)
+			Threads = 1;
+		auto Once = [&]() {
+			if(Threads > 1)
+				return Net.DownloadFileMulti(Url, Dest, Threads, Cb, Note);
+			return Net.DownloadFile(Url, Dest, Cb);
+		};
+		HttpResult R = Once();
 		if(!R.Ok && !Net.Direct)
 		{
 			LogAt(LogLevel::Warn, "  下载失败（" + R.Error + "；" + (Net.Proxy.empty() ? "当前按系统代理设置走" : "当前代理 " + Net.Proxy) +
@@ -70,7 +87,7 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			Net.Proxy.clear();
 			Net.Direct = true;
 			GitProxy = false;
-			R = Net.DownloadFile(Url, Dest, Cb);
+			R = Once();
 		}
 		return R;
 	};
@@ -214,6 +231,10 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 	if(Log)
 		Log(LogLevel::Info, std::string("  网络：") + (Net.MirrorPrefix.empty() ? "不用镜像" : "镜像 " + Net.MirrorPrefix) +
 					 (Opt.Proxy.empty() ? "；不用代理（跟随 Windows 系统设置）" : "；代理 http://" + Opt.Proxy));
+	if(Log)
+		Log(LogLevel::Info, std::string("  下载线程：") + (Opt.DownloadThreads > 1
+									  ? std::to_string(Opt.DownloadThreads) + "（HTTP Range 分段多连接）"
+									  : "1（单连接）"));
 	const std::string WorkDir0 = Opt.WorkDir.empty() ? JoinPath(AppDir, "src") : Opt.WorkDir;
 	const std::string ClientDir0 = Opt.ClientDir.empty() ? JoinPath(AppDir, "client") : Opt.ClientDir;
 	if(WorkDir0.empty())
@@ -319,10 +340,18 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			Error = "用户已取消（本次下载已自动清理）";
 			return false;
 		}
+		if(!R.Ok() && !Cancelled())
+		{
+			// 低速保护触发/传输被掐断：同样的设置重试一次，换新连接往往就过了
+			// （代理软件在运行时直连反而更慢，所以先别降级）。
+			LogAt(LogLevel::Warn, "  克隆中断（多半是代理/网络传输被掐断）——原设置重试一次（换新连接）");
+			RemoveTree(Tree);
+			R = Do(Opt.GitPath, WithNet({"clone", "--progress", "--depth", "1", "--branch", Opt.Version.Ref, CloneUrl, Tree}), "");
+		}
 		if(!R.Ok() && GitProxy)
 		{
 			// 多半是代理软件没在运行：关掉代理（镜像仍保留）再试一次，别让整个安装白白失败
-			LogAt(LogLevel::Warn, "  克隆失败，而本次勾了代理 " + Opt.Proxy + " —— 若代理软件没开请先启动；现在先关掉代理重试一次");
+			LogAt(LogLevel::Warn, "  克隆仍失败，而本次勾了代理 " + Opt.Proxy + " —— 关掉代理直连重试一次");
 			GitProxy = false;
 			RemoveTree(Tree);
 			R = Do(Opt.GitPath, WithNet({"clone", "--progress", "--depth", "1", "--branch", Opt.Version.Ref, CloneUrl, Tree}), "");
@@ -372,6 +401,12 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 				return false;
 			}
 		ProcessResult R = Do(Opt.GitPath, WithNet({"submodule", "update", "--progress", "--init", "--recursive"}), Tree);
+		if(!R.Ok() && !Cancelled())
+		{
+			// 同克隆：传输被掐断时原设置重试一次（换新连接），别直接放弃
+			LogAt(LogLevel::Warn, "  子模块初始化中断——原设置重试一次（换新连接）");
+			R = Do(Opt.GitPath, WithNet({"submodule", "update", "--progress", "--init", "--recursive"}), Tree);
+		}
 		if(!R.Ok())
 		{
 			CleanupPartial();
@@ -475,56 +510,68 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		std::string Zip = Opt.FfmpegZip;
 		if(Zip.empty())
 			Zip = JoinPath(WorkDir0, "ffmpeg-8.1.zip");
-		if(!PathExists(Zip))
+		// 解压即验证：多线程下载把文件**预分配到最终大小**再并行写分段，进程被杀/崩溃
+		// 会留下"尺寸正常、内容半截"的坏 zip（tar -t 只查目录测不出分段缺失），直接复用
+		// 必然在解压时炸。所以"解压"本身就是验证：失败就删掉重下一次（用户要求中断不残留）。
+		std::string Ex = JoinPath(WorkDir0, "ffmpeg-extract");
+		for(int Attempt = 0; Attempt < 2 && !FfmpegInstalled; ++Attempt)
 		{
-			std::string Url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip";
-			std::string ShowUrl = Net.ApplyMirror(Url);
-			if(CheckCancel())
-				{
-					CleanupPartial();
-					return false;
-				}
-			Report(60, "下载 FFmpeg 8.1：" + ShowUrl);
-			int64_t LastBytes = 0;
-			auto LastT = std::chrono::steady_clock::now();
-			HttpResult D = Download(Url, Zip, [&](int64_t Got, int64_t Total) {
-				auto Now = std::chrono::steady_clock::now();
-				double Dt = std::chrono::duration<double>(Now - LastT).count();
-				if(Dt < 0.5)
-					return;
-				double Speed = (double)(Got - LastBytes) / 1048576.0 / Dt;   // MB/s
-				LastBytes = Got;
-				LastT = Now;
-				char Buf[512];
-				if(Total > 0)
-					snprintf(Buf, sizeof(Buf), "下载 FFmpeg 8.1：%d%%（%.2f MB/s，已 %.1f/%.1f MB）%s",
-						(int)(Got * 100 / Total), Speed, Got / 1048576.0, Total / 1048576.0, ShowUrl.c_str());
-				else
-					snprintf(Buf, sizeof(Buf), "下载 FFmpeg 8.1：已 %.1f MB（%.2f MB/s）%s", Got / 1048576.0, Speed, ShowUrl.c_str());
-				Report(60 + (int)(18.0 * (Total > 0 ? (double)Got / (double)Total : 0.0)), Buf);
-			});
-			if(!D.Ok)
+			if(!PathExists(Zip))
 			{
-				if(Cancelled())
+				std::string Url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip";
+				std::string ShowUrl = Net.ApplyMirror(Url);
+				if(CheckCancel())
+					{
+						CleanupPartial();
+						return false;
+					}
+				Report(60, "下载 FFmpeg 8.1：" + ShowUrl);
+				int64_t LastBytes = 0;
+				auto LastT = std::chrono::steady_clock::now();
+				HttpResult D = Download(Url, Zip, [&](int64_t Got, int64_t Total) {
+					auto Now = std::chrono::steady_clock::now();
+					double Dt = std::chrono::duration<double>(Now - LastT).count();
+					if(Dt < 0.5)
+						return;
+					double Speed = (double)(Got - LastBytes) / 1048576.0 / Dt;   // MB/s
+					LastBytes = Got;
+					LastT = Now;
+					char Buf[512];
+					const std::string Th = Opt.DownloadThreads > 1 ? ("，" + std::to_string(Opt.DownloadThreads) + " 线程") : "";
+					if(Total > 0)
+						snprintf(Buf, sizeof(Buf), "下载 FFmpeg 8.1：%d%%（%.2f MB/s，已 %.1f/%.1f MB%s）%s",
+							(int)(Got * 100 / Total), Speed, Got / 1048576.0, Total / 1048576.0, Th.c_str(), ShowUrl.c_str());
+					else
+						snprintf(Buf, sizeof(Buf), "下载 FFmpeg 8.1：已 %.1f MB（%.2f MB/s%s）%s", Got / 1048576.0, Speed, Th.c_str(), ShowUrl.c_str());
+					Report(60 + (int)(18.0 * (Total > 0 ? (double)Got / (double)Total : 0.0)), Buf);
+				});
+				if(!D.Ok)
 				{
-					CleanupPartial();
-					Error = "用户已取消（本次下载已自动清理）";
-					return false;
+					if(Cancelled())
+					{
+						CleanupPartial();
+						Error = "用户已取消（本次下载已自动清理）";
+						return false;
+					}
+					LogAt(LogLevel::Warn, "  FFmpeg 下载失败：" + D.Error + "（不影响图片背景，视频会不可用；可从 BtbN/FFmpeg-Builds 手动下载后重试）");
+					break;
 				}
-				LogAt(LogLevel::Warn, "  FFmpeg 下载失败：" + D.Error + "（不影响图片背景，视频会不可用；可从 BtbN/FFmpeg-Builds 手动下载后重试）");
 			}
-		}
-		if(PathExists(Zip))
-		{
-			std::string Ex = JoinPath(WorkDir0, "ffmpeg-extract");
 			RemoveTree(Ex);
 			MakeDirs(Ex);
 			ProcessResult T = Do("tar", {"-xf", Zip, "-C", Ex}, "");
-			if(!T.Ok())
+			if(T.Ok())
 			{
-				LogAt(LogLevel::Warn, "  tar 解压失败，改用 PowerShell Expand-Archive");
-				Do("powershell", {"-NoProfile", "-Command", "Expand-Archive -LiteralPath '" + Zip + "' -DestinationPath '" + Ex + "' -Force"}, "");
+				FfmpegInstalled = true;
+				break;
 			}
+			LogAt(LogLevel::Warn, Attempt == 0
+				? "  ffmpeg zip 解压失败——多半是上次下载被中断留下的半截文件，删除后重新下载再试"
+				: "  重新下载后仍解压失败，放弃 FFmpeg（不影响图片背景，视频会不可用）");
+			DeleteFileW(Utf8ToWide(Zip).c_str());
+		}
+		if(FfmpegInstalled)
+		{
 			// bsdtar 解压后通常有一层目录
 			std::string Root = Ex;
 			{
@@ -555,14 +602,23 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			}
 			const std::string Libs = JoinPath(Tree, "ddnet-libs\\ffmpeg");
 			CopyTree(JoinPath(Root, "include"), JoinPath(Libs, "include"), Error);
-			MakeDirs(JoinPath(Libs, "windows\\lib"));
-			CopyTree(JoinPath(Root, "lib"), JoinPath(Libs, "windows\\lib"), Error);
+			// DDNet 19 系（TClient 同）的约定：x64 的导入库与运行时 DLL 都放在
+			// windows/lib64 —— FindFFMPEG.cmake 在这里 find_library，并把同目录的
+			// avcodec-62.dll 等 5 个 DLL 列进 FFMPEG_COPY_FILES（configure 时 file(COPY)
+			// 到输出目录）。装错位置（如 windows/lib）会在 configure 阶段报
+			// "file COPY cannot find .../lib64/avcodec-62.dll"。
+			std::string Lib64 = JoinPath(Libs, "windows\\lib64");
+			MakeDirs(Lib64);
+			CopyTree(JoinPath(Root, "lib"), Lib64, Error);
 			MakeDirs(ThirdPartyDll);
 			for(const char *Dll : {"avcodec-62.dll", "avformat-62.dll", "avutil-60.dll", "swresample-6.dll", "swscale-9.dll"})
 			{
 				std::string S = JoinPath(JoinPath(Root, "bin"), Dll);
 				if(PathExists(S))
-					CopyTree(S, JoinPath(ThirdPartyDll, Dll), Error);
+				{
+					CopyTree(S, JoinPath(Lib64, Dll), Error);        // 给 configure 的 file(COPY) 用
+					CopyTree(S, JoinPath(ThirdPartyDll, Dll), Error); // 给成品 client\ 目录兜底
+				}
 			}
 			// touch 头文件：避免 CMake 认为无需重编而导致 ABI 错位崩溃（0xc0000409）
 			{
@@ -599,10 +655,57 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		Step(StepNo++, "跳过 FFmpeg（仅图片背景可用）");
 
 	// -------------------------------------------------------- 6. 构建 ------
-	std::string Dist = ClientDir0.empty() ? JoinPath(WorkDir0, "Client") : ClientDir0;
+	// client\ 按「客户端种类-版本号」分子目录存放（用户要求）：tclient 与 ddnet、
+	// 不同版本互不覆盖，如 client\tclient-V10.9.0 和 client\ddnet-19.1
+	auto SanitizeRef = [](std::string S) {
+		for(char &c : S)
+			if(c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|')
+				c = '-';
+		return S;
+	};
+	std::string Dist = ClientDir0.empty() ? JoinPath(WorkDir0, "Client")
+					  : JoinPath(ClientDir0, SanitizeRef(Opt.Source.Id + "-" + Opt.Version.Ref));
 	bool Built = false;
 	if(Opt.Build)
 	{
+		// cmake 可能不在 PATH（本机只有 VS 自带的 cmake）：
+		// 默认值 "cmake" 时先 where 探测，失败再按常见 VS/CMake 安装位置找。
+		std::string Cmake = Opt.CmakePath;
+		if(Cmake == "cmake")
+		{
+			std::string Found;
+			ProcessResult W = RunProcess("where", {"cmake"}, "", nullptr, nullptr);
+			if(W.Ok() && !W.Output.empty())
+			{
+				Found = W.Output;
+				size_t Pos = Found.find_first_of("\r\n");
+				if(Pos != std::string::npos)
+					Found = Found.substr(0, Pos);
+				while(!Found.empty() && (Found.back() == ' ' || Found.back() == '\r' || Found.back() == '\n'))
+					Found.pop_back();
+			}
+			if(Found.empty())
+			{
+				for(const char *Cand : {
+					"C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe",
+					"C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe",
+					"C:\\Program Files\\Microsoft Visual Studio\\2022\\Professional\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe",
+					"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe",
+					"C:\\Program Files\\CMake\\bin\\cmake.exe"})
+				{
+					if(PathExists(Cand))
+					{
+						Found = Cand;
+						break;
+					}
+				}
+			}
+			if(!Found.empty())
+			{
+				LogAt(LogLevel::Info, "  使用 cmake：" + Found);
+				Cmake = Found;
+			}
+		}
 		if(CheckCancel())
 			{
 				CleanupPartial();
@@ -610,11 +713,19 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			}
 		Step(StepNo++, "配置 CMake");
 		Report(82, "配置 CMake…");
-		ProcessResult C = Do(Opt.CmakePath, {"-S", ".", "-B", "build", "-A", "x64", "-DVULKAN=OFF", "-DDOWNLOAD_GTEST=OFF"}, Tree);
+		ProcessResult C = Do(Cmake, {"-S", ".", "-B", "build", "-A", "x64", "-DVULKAN=OFF", "-DDOWNLOAD_GTEST=OFF"}, Tree);
 		if(!C.Ok())
 		{
-			Error = "CMake 配置失败（检查 MSVC/CMake 是否可用）";
-			return false;
+			// 失败的 configure 会留下毒化的 CMakeCache.txt（半套变量），
+			// 直接重跑大概率还是错。清掉 build 目录重试一次。
+			LogAt(LogLevel::Warn, "  CMake 配置失败，清空 build 缓存后重试一次");
+			RemoveTree(JoinPath(Tree, "build"));
+			C = Do(Cmake, {"-S", ".", "-B", "build", "-A", "x64", "-DVULKAN=OFF", "-DDOWNLOAD_GTEST=OFF"}, Tree);
+			if(!C.Ok())
+			{
+				Error = "CMake 配置失败（重试后仍失败；检查 MSVC/CMake 是否可用，日志里有详细错误）";
+				return false;
+			}
 		}
 		if(CheckCancel())
 			{
@@ -627,7 +738,7 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		Gp.LastUi = CompileT0;
 		InCompile = true;
 		Report(-1, "编译 game-client：开始编译（编译没有百分比 → 进度条滚动表示在跑；按「取消」会终止编译器）");
-		ProcessResult B = Do(Opt.CmakePath, {"--build", "build", "--config", Opt.Config, "--target", "game-client", "--parallel", "4"}, Tree);
+		ProcessResult B = Do(Cmake, {"--build", "build", "--config", Opt.Config, "--target", "game-client", "--parallel", "4"}, Tree);
 		if(!B.Ok())
 		{
 			if(Cancelled())
@@ -648,6 +759,14 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		RemoveTree(Dist);
 		MakeDirs(Dist);
 		CopyTree(JoinPath(Tree, "build\\" + Opt.Config + "\\DDNet.exe"), JoinPath(Dist, "DDNet.exe"), Error);
+		// 构建配置目录里编出来的运行时 DLL 一并带上（TClient 本地构建的 steam_api.dll
+		// 就在这里；漏拷会启动报"找不到 steam_api.dll"）
+		{
+			int Copied = 0;
+			std::string CErr;
+			if(CollectRuntimeDlls(JoinPath(Tree, "build\\" + Opt.Config), Dist, Copied, CErr) && Copied > 0)
+				LogAt(LogLevel::Info, "  从构建输出目录带上 " + std::to_string(Copied) + " 个运行时 DLL");
+		}
 		{
 			WIN32_FIND_DATAW Fd;
 			std::string Pattern = JoinPath(JoinPath(Tree, "build"), "*.dll");
@@ -668,6 +787,30 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		CopyTree(JoinPath(Tree, "data"), JoinPath(Dist, "data"), Error);
 		if(PathExists(JoinPath(Tree, "storage.cfg")))
 			CopyTree(JoinPath(Tree, "storage.cfg"), JoinPath(Dist, "storage.cfg"), Error);
+		// 完整性校验（强校验，不过就不许报"完成"）：解析 DDNet.exe 的 PE 导入表，
+		// 每个非系统 DLL 依赖都必须在 client\ 里——缺了就报安装中断并点名缺谁。
+		{
+			std::vector<std::string> Missing;
+			std::string VErr;
+			if(!VerifyExeImports(JoinPath(Dist, "DDNet.exe"), Dist, Missing, VErr))
+			{
+				if(!VErr.empty())
+				{
+					LogAt(LogLevel::Error, "  完整性校验无法进行：" + VErr);
+					Error = "完整性校验失败：" + VErr;
+				}
+				else
+				{
+					std::string Miss;
+					for(size_t i = 0; i < Missing.size() && i < 8; ++i)
+						Miss += (i ? "、" : "") + Missing[i];
+					LogAt(LogLevel::Error, "  完整性校验失败：client\\ 缺少运行时 DLL：" + Miss);
+					Error = "完整性校验失败：缺少运行时 DLL：" + Miss;
+				}
+				return false;
+			}
+			LogAt(LogLevel::Info, "  完整性校验通过：DDNet.exe 的 DLL 依赖全部就绪");
+		}
 		LogAt(LogLevel::Info, "  完成：双击 " + JoinPath(Dist, "DDNet.exe"));
 	}
 	else

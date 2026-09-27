@@ -7,12 +7,18 @@
 #include <shellapi.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <mutex>
 #include <sstream>
+#include <thread>
 
 #pragma comment(lib, "wininet.lib")
+
+// 多线程下载的"热"线程数（见 core.h）：UI 线程写，工作线程每次下载开始时读
+std::atomic<int> g_DlThreadsHint{0};
 
 // ============================================================ 小工具 =========
 std::string WideToUtf8(const std::wstring &W)
@@ -119,9 +125,153 @@ bool RemoveTree(const std::string &P)
 	return !PathExists(P);
 }
 
+// ------------------------------------------------ 完整性校验（用户要求）----
+// 背景：TClient 在构建输出目录里本地编译 steam_api.dll，组装时漏拷导致
+// DDNet.exe 启动报"找不到 steam_api.dll"而安装器却报"全部完成"。
+// ①CollectRuntimeDlls：构建配置目录里的 *.dll 一律带上；②VerifyExeImports：
+// 解析 PE 导入表逐个核对非系统 DLL 依赖，缺了就在"完成"之前拦下来。
+bool CollectRuntimeDlls(const std::string &BuildDir, const std::string &Dist, int &Copied, std::string &Error)
+{
+	Copied = 0;
+	WIN32_FIND_DATAW Fd;
+	HANDLE H = FindFirstFileW(Utf8ToWide(JoinPath(BuildDir, "*.dll")).c_str(), &Fd);
+	if(H == INVALID_HANDLE_VALUE)
+		return true;   // 配置目录没有 DLL 也正常
+	do {
+		std::string Name = WideToUtf8(Fd.cFileName);
+		if(Name == "." || Name == "..")
+			continue;
+		if(!CopyFileW(Utf8ToWide(JoinPath(BuildDir, Name)).c_str(),
+			      Utf8ToWide(JoinPath(Dist, Name)).c_str(), FALSE))
+		{
+			Error = "复制运行时 DLL 失败: " + Name;
+			FindClose(H);
+			return false;
+		}
+		Copied++;
+	} while(FindNextFileW(H, &Fd));
+	FindClose(H);
+	return true;
+}
+
+static bool ImportRvaToOff(const std::vector<IMAGE_SECTION_HEADER> &Secs, DWORD Rva, DWORD &Off)
+{
+	for(const auto &S : Secs)
+	{
+		DWORD Size = S.Misc.VirtualSize > S.SizeOfRawData ? S.Misc.VirtualSize : S.SizeOfRawData;
+		if(Rva >= S.VirtualAddress && Rva < S.VirtualAddress + Size)
+		{
+			Off = S.PointerToRawData + (Rva - S.VirtualAddress);
+			return true;
+		}
+	}
+	return false;
+}
+
+bool VerifyExeImports(const std::string &ExePath, const std::string &Dir,
+		      std::vector<std::string> &Missing, std::string &Error)
+{
+	Missing.clear();
+	std::vector<char> Buf;
+	{
+		HANDLE F = CreateFileW(Utf8ToWide(ExePath).c_str(), GENERIC_READ, FILE_SHARE_READ,
+				       nullptr, OPEN_EXISTING, 0, nullptr);
+		if(F == INVALID_HANDLE_VALUE)
+		{
+			Error = "打不开可执行文件: " + ExePath;
+			return false;
+		}
+		LARGE_INTEGER Sz;
+		if(!GetFileSizeEx(F, &Sz) || Sz.QuadPart < 0x200)
+		{
+			CloseHandle(F);
+			Error = "不是有效的可执行文件: " + ExePath;
+			return false;
+		}
+		Buf.resize((size_t)Sz.QuadPart);
+		DWORD Got = 0;
+		BOOL Rd = ReadFile(F, Buf.data(), (DWORD)Buf.size(), &Got, nullptr);
+		CloseHandle(F);
+		if(!Rd || Got != Buf.size() || memcmp(Buf.data(), "MZ", 2) != 0)
+		{
+			Error = "不是有效的可执行文件: " + ExePath;
+			return false;
+		}
+	}
+	const IMAGE_DOS_HEADER *Dos = (const IMAGE_DOS_HEADER *)Buf.data();
+	const IMAGE_NT_HEADERS *Nt = (const IMAGE_NT_HEADERS *)(Buf.data() + Dos->e_lfanew);
+	if(Nt->Signature != IMAGE_NT_SIGNATURE)
+	{
+		Error = "PE 头无效: " + ExePath;
+		return false;
+	}
+	const IMAGE_DATA_DIRECTORY &Imp = Nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+	std::vector<IMAGE_SECTION_HEADER> Secs(Nt->FileHeader.NumberOfSections);
+	const IMAGE_SECTION_HEADER *S0 = (const IMAGE_SECTION_HEADER *)
+		((const BYTE *)&Nt->OptionalHeader + Nt->FileHeader.SizeOfOptionalHeader);
+	for(size_t i = 0; i < Secs.size(); ++i)
+		Secs[i] = S0[i];
+	auto NameAt = [&](DWORD Rva) -> std::string {
+		DWORD Off = 0;
+		if(!ImportRvaToOff(Secs, Rva, Off) || Off + 64 > Buf.size())
+			return std::string();
+		const char *P = Buf.data() + Off;
+		size_t N = 0;
+		while(N < 64 && P[N])
+			++N;
+		return std::string(P, N);
+	};
+	auto SysHas = [&](const std::string &Dll) -> bool {
+		wchar_t Ws[MAX_PATH];
+		UINT N = GetSystemDirectoryW(Ws, MAX_PATH);   // 64 位系统目录，不吃 WOW64 重定向
+		if(N > 0 && N < MAX_PATH && PathExists(WideToUtf8(Ws) + "\\" + Dll))
+			return true;
+		return PathExists(std::string("C:\\Windows\\SysWOW64\\") + Dll);
+	};
+	for(DWORD O = Imp.VirtualAddress; O != 0; O += sizeof(IMAGE_IMPORT_DESCRIPTOR))
+	{
+		DWORD Off = 0;
+		if(!ImportRvaToOff(Secs, O, Off) || Off + sizeof(IMAGE_IMPORT_DESCRIPTOR) > Buf.size())
+			break;
+		const IMAGE_IMPORT_DESCRIPTOR *D = (const IMAGE_IMPORT_DESCRIPTOR *)(Buf.data() + Off);
+		if(D->Name == 0)
+			break;
+		std::string Dll = NameAt(D->Name);
+		if(Dll.empty())
+			continue;
+		for(auto &c : Dll)
+			c = (char)tolower((unsigned char)c);
+		// Windows API Set（api-ms-win-* / ext-ms-*）由系统加载器虚拟解析，
+		// 不是要随包分发的文件（libwinpthread 等会导入它们，误报会错杀）
+		if(Dll.rfind("api-ms-win-", 0) == 0 || Dll.rfind("ext-ms-", 0) == 0)
+			continue;
+		if(PathExists(JoinPath(Dir, Dll)) || SysHas(Dll))
+			continue;
+		Missing.push_back(Dll);
+	}
+	return Missing.empty();
+}
+
 bool CopyTree(const std::string &From, const std::string &To, std::string &Error)
 {
-	std::wstring Cmd = L"cmd.exe /c xcopy \"" + Utf8ToWide(From) + L"\" \"" + Utf8ToWide(To) + L"\" /E /I /Y /Q >NUL";
+	// 单文件源必须走 CopyFileW：xcopy 对"单文件源 + 不存在的目标"会弹
+	// "F = 文件 / D = 目录"交互提示，而本程序的子进程无窗口无 stdin，提示永远
+	// 没人回答 → xcopy 以 0% CPU 永久挂起（实测卡死整个安装流水线）。
+	DWORD Attr = GetFileAttributesW(Utf8ToWide(From).c_str());
+	if(Attr != INVALID_FILE_ATTRIBUTES && !(Attr & FILE_ATTRIBUTE_DIRECTORY))
+	{
+		if(!CopyFileW(Utf8ToWide(From).c_str(), Utf8ToWide(To).c_str(), FALSE))
+		{
+			Error = "复制文件失败: " + From;
+			return false;
+		}
+		return true;
+	}
+	// 目录：xcopy。目标末尾补反斜杠，强制按目录处理，同样杜绝 F/D 提示。
+	std::wstring ToW = Utf8ToWide(To);
+	if(!ToW.empty() && ToW.back() != L'\\')
+		ToW += L'\\';
+	std::wstring Cmd = L"cmd.exe /c xcopy \"" + Utf8ToWide(From) + L"\" \"" + ToW + L"\" /E /I /Y /Q >NUL";
 	STARTUPINFOW Si = {sizeof(Si)};
 	PROCESS_INFORMATION Pi = {};
 	std::wstring Mutable = Cmd;
@@ -704,9 +854,323 @@ HttpResult Http::DownloadFile(const std::string &Url, const std::string &DestPat
 	}
 	fclose(F);
 	InternetCloseHandle(Req);
-	R.Ok = (R.Status >= 200 && R.Status < 300) && Got > 0;
+	// Total 已知时必须下满：连接中途断开会留下 Got<Total 的半截文件，
+	// 不能当成"下载成功"交给下一步（解压/校验都会炸）。
+	R.Ok = (R.Status >= 200 && R.Status < 300) && Got > 0 && (Total <= 0 || Got >= Total);
 	if(!R.Ok)
-		R.Error = R.Error.empty() ? ("下载不完整 HTTP " + std::to_string(R.Status)) : R.Error;
+	{
+		if(Total > 0 && Got < Total && R.Error.empty())
+			R.Error = "下载不完整：" + std::to_string((long long)Got) + "/" + std::to_string((long long)Total) + " 字节（连接中断）";
+		else if(R.Error.empty())
+			R.Error = "下载不完整 HTTP " + std::to_string(R.Status);
+		DeleteFileW(Utf8ToWide(DestPath).c_str());   // 半截文件不留到下一次
+	}
+	return R;
+}
+
+// ------------------------------------------------ 多线程分段下载（NDM 式）-----
+namespace
+{
+	// WinInet 的**自动重定向会丢掉自定义请求头**（包括 Range）：
+	// github.com 的 release 下载会 302 到 release-assets.githubusercontent.com，
+	// InternetOpenUrlW 自动跟随之后 Range 头就没了，分段请求只会拿到 200 全量，
+	// 多线程永远走不通（每次都静默退回单连接）。所以分段前先手动把重定向链走完
+	// （NO_AUTO_REDIRECT 逐跳跟随 Location），分段请求直接打"最终地址"，Range 才会生效。
+	// 顺带在最终响应上读 Content-Length，省一次单独的预检请求。
+	// 返回最终地址；TotalOut = 文件大小（拿不到 -1）；StatusOut = 最终 HTTP 状态码。
+	std::wstring ResolveFinalUrl(const std::wstring &Url0, const std::string &Proxy, bool Direct,
+		int64_t &TotalOut, int &StatusOut, std::string &Err)
+	{
+		std::wstring Cur = Url0;
+		TotalOut = -1;
+		StatusOut = 0;
+		for(int Hop = 0; Hop < 6; ++Hop)
+		{
+			InetHandle Inet;
+			Inet.H = OpenInet(Proxy, Direct, L"ddnet-module-installer");
+			if(!Inet.H)
+			{
+				Err = "InternetOpen 失败";
+				return Cur;
+			}
+			int Tmo = 30;
+			InternetSetOptionW(Inet.H, INTERNET_OPTION_CONNECT_TIMEOUT, (void *)&Tmo, sizeof(Tmo));
+			URL_COMPONENTSW Uc = {sizeof(Uc)};
+			wchar_t Hst[256] = {}, Pth[2048] = {}, Ext[1024] = {};
+			Uc.dwHostNameLength = 255; Uc.lpszHostName = Hst;
+			Uc.dwUrlPathLength = 2047; Uc.lpszUrlPath = Pth;
+			Uc.dwExtraInfoLength = 1023; Uc.lpszExtraInfo = Ext;
+			if(!InternetCrackUrlW(Cur.c_str(), (DWORD)Cur.size(), 0, &Uc))
+			{
+				Err = "URL 解析失败";
+				return Cur;
+			}
+			InetHandle Conn;
+			Conn.H = InternetConnectW(Inet.H, Hst, Uc.nPort, nullptr, nullptr, INTERNET_SERVICE_HTTP, 0, 0);
+			if(!Conn.H)
+			{
+				Err = "连接失败";
+				return Cur;
+			}
+			std::wstring Path = Uc.dwUrlPathLength ? std::wstring(Pth, Uc.dwUrlPathLength) : std::wstring(L"/");
+			if(Uc.dwExtraInfoLength)
+				Path += std::wstring(Ext, Uc.dwExtraInfoLength);   // ?query 也属于请求路径
+			DWORD Flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_NO_AUTO_REDIRECT;
+			if(Uc.nScheme == INTERNET_SCHEME_HTTPS)
+				Flags |= INTERNET_FLAG_SECURE;
+			InetHandle Req;
+			Req.H = HttpOpenRequestW(Conn.H, L"GET", Path.c_str(), nullptr, nullptr, nullptr, Flags, 0);
+			if(!Req.H)
+			{
+				Err = "构造请求失败";
+				return Cur;
+			}
+			const wchar_t *Hd = L"User-Agent: ddnet-module-installer\r\nAccept: */*\r\n";
+			if(!HttpSendRequestW(Req.H, Hd, (DWORD)-1L, nullptr, 0))
+			{
+				Err = "请求发送失败";
+				return Cur;
+			}
+			DWORD Code = 0, Len = sizeof(Code);
+			HttpQueryInfoW(Req.H, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &Code, &Len, nullptr);
+			StatusOut = (int)Code;
+			if(Code >= 300 && Code < 400)
+			{
+				wchar_t Loc[8192] = {};
+				DWORD LL = sizeof(Loc) - 2;
+				if(!HttpQueryInfoW(Req.H, HTTP_QUERY_LOCATION, Loc, &LL, nullptr))
+				{
+					Err = "重定向但拿不到 Location";
+					return Cur;
+				}
+				// Location 可能是相对地址，合成绝对地址再进下一跳
+				wchar_t Abs[8192] = {};
+				DWORD AL = sizeof(Abs) / sizeof(wchar_t) - 1;
+				Cur = InternetCombineUrlW(Cur.c_str(), Loc, Abs, &AL, 0) ? std::wstring(Abs) : std::wstring(Loc);
+				continue;   // 只读头不收正文，句柄析构即断开
+			}
+			char Cl[64] = {};
+			DWORD ClLen = sizeof(Cl);
+			if(HttpQueryInfoA(Req.H, HTTP_QUERY_CONTENT_LENGTH, Cl, &ClLen, nullptr))
+				TotalOut = _atoi64(Cl);
+			return Cur;   // 非重定向：这就是最终地址
+		}
+		Err = "重定向次数过多";
+		return Cur;
+	}
+}
+
+HttpResult Http::DownloadFileMulti(const std::string &Url, const std::string &DestPath, int Threads,
+	const std::function<void(int64_t, int64_t)> &Progress,
+	const std::function<void(const std::string &)> &Note) const
+{
+	auto Say = [&](const std::string &S) {
+		if(Note)
+			Note(S);
+	};
+	HttpResult R;
+	if(Threads < 2)
+		return DownloadFile(Url, DestPath, Progress);   // 没开多线程
+
+	const std::string Final = ApplyMirror(Url);
+	// 先把重定向链手动走完（WinInet 自动重定向会丢 Range 头），拿到最终地址与文件大小
+	int PreStatus = 0;
+	std::string PreErr;
+	int64_t Total = -1;
+	const std::string FinalUrl = WideToUtf8(ResolveFinalUrl(WUrl(Final), Proxy, Direct, Total, PreStatus, PreErr));
+	if(PreStatus != 200 && PreStatus != 206)
+	{
+		Say("  多线程下载：预检失败（HTTP " + std::to_string(PreStatus) + (PreErr.empty() ? "" : "，" + PreErr) + "），改用单连接");
+		return DownloadFile(Url, DestPath, Progress);
+	}
+	if(Total <= 0)
+	{
+		Say("  多线程下载：拿不到文件大小（无 Content-Length），改用单连接");
+		return DownloadFile(Url, DestPath, Progress);
+	}
+
+	// 分块：最多 16 段，且每段至少 1MB
+	int N = Threads > 16 ? 16 : Threads;
+	int64_t MaxChunks = Total / (1024 * 1024);
+	if(MaxChunks < 1)
+		MaxChunks = 1;
+	if((int64_t)N > MaxChunks)
+		N = (int)MaxChunks;
+	if(N < 2)
+	{
+		Say("  多线程下载：文件较小（" + std::to_string((long long)Total) + " 字节），不值得分段，改用单连接");
+		return DownloadFile(Url, DestPath, Progress);
+	}
+	Say("  多线程下载：开 " + std::to_string(N) + " 个连接分段拉取，共 " +
+		std::to_string((long long)(Total / 1048576)) + " MB（每段独立断点续传）");
+
+	// 预分配目标文件到最终大小，之后各线程直接按偏移写入自己的区间
+	{
+		HANDLE F = CreateFileW(Utf8ToWide(DestPath).c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+			nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if(F == INVALID_HANDLE_VALUE)
+		{
+			R.Error = "无法写入: " + DestPath;
+			return R;
+		}
+		LARGE_INTEGER Li;
+		Li.QuadPart = Total;
+		SetFilePointerEx(F, Li, nullptr, FILE_BEGIN);
+		SetEndOfFile(F);
+		CloseHandle(F);
+	}
+
+	std::vector<int64_t> Start(N), End(N);
+	const int64_t Per = Total / N;
+	for(int i = 0; i < N; ++i)
+	{
+		Start[i] = Per * i;
+		End[i] = (i == N - 1) ? (Total - 1) : (Per * (i + 1) - 1);
+	}
+	std::atomic<int64_t> Done{0};
+	std::atomic<int> Failed{0};
+	std::mutex FailMx;
+	std::string FailMsg;
+	const std::string Fx = FinalUrl;   // 已解析完重定向的最终地址：分段请求打它，Range 才有效
+	const std::string Dx = DestPath;
+	const std::string Px = Proxy;
+	const bool Dx2 = Direct;
+
+	auto Worker = [&](int Idx) {
+		int64_t Pos = Start[Idx];
+		const int64_t EndPos = End[Idx];
+		int Attempt = 0;
+		while(Pos <= EndPos && Attempt < 4)
+		{
+			if(pCancel && pCancel->load())
+				return;
+			++Attempt;
+			InetHandle Inet;
+			Inet.H = OpenInet(Px, Dx2, L"ddnet-module-installer");
+			if(!Inet.H)
+			{
+				Sleep(300);
+				continue;
+			}
+			int Tmo = 60;
+			InternetSetOptionW(Inet.H, INTERNET_OPTION_CONNECT_TIMEOUT, (void *)&Tmo, sizeof(Tmo));
+			InternetSetOptionW(Inet.H, INTERNET_OPTION_RECEIVE_TIMEOUT, (void *)&Tmo, sizeof(Tmo));
+			const std::wstring Hdr = L"User-Agent: ddnet-module-installer\r\nRange: bytes=" +
+						 std::to_wstring(Pos) + L"-" + std::to_wstring(EndPos) + L"\r\n";
+			HINTERNET Req = InternetOpenUrlW(Inet.H, WUrl(Fx).c_str(), Hdr.c_str(),
+				(DWORD)-1L, INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_SECURE, 0);
+			if(!Req)
+			{
+				Sleep(300 * Attempt);
+				continue;
+			}
+			DWORD Status = 0, Len = sizeof(Status);
+			HttpQueryInfoW(Req, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &Status, &Len, nullptr);
+			if(Status != 206)
+			{
+				InternetCloseHandle(Req);
+				std::lock_guard<std::mutex> Lk(FailMx);
+				if(FailMsg.empty())
+					FailMsg = "分段请求返回 HTTP " + std::to_string(Status) + "（不是 206）";
+				Failed++;
+				return;
+			}
+			HANDLE H = CreateFileW(Utf8ToWide(Dx).c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+				nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+			if(H == INVALID_HANDLE_VALUE)
+			{
+				InternetCloseHandle(Req);
+				std::lock_guard<std::mutex> Lk(FailMx);
+				if(FailMsg.empty())
+					FailMsg = "无法打开目标文件写分段";
+				Failed++;
+				return;
+			}
+			LARGE_INTEGER Off;
+			Off.QuadPart = Pos;
+			SetFilePointerEx(H, Off, nullptr, FILE_BEGIN);
+			char Buf[65536];
+			bool Ok = true;
+			for(;;)
+			{
+				if(pCancel && pCancel->load())
+				{
+					Ok = false;
+					break;
+				}
+				DWORD Read = 0;
+				if(!InternetReadFile(Req, Buf, sizeof(Buf), &Read) || Read == 0)
+				{
+					Ok = false;
+					break;
+				}
+				DWORD Written = 0;
+				if(!WriteFile(H, Buf, Read, &Written, nullptr) || Written != Read)
+				{
+					Ok = false;
+					break;
+				}
+				Pos += Read;
+				Done += Read;
+				if(Pos > EndPos)
+					break;
+			}
+			CloseHandle(H);
+			InternetCloseHandle(Req);
+			if(Ok && Pos > EndPos)
+				return;   // 本段拉完
+			if(pCancel && pCancel->load())
+				return;
+			Sleep(300 * Attempt);   // 断点续传：下一轮从 Pos 继续
+		}
+		if(Pos <= EndPos)
+		{
+			std::lock_guard<std::mutex> Lk(FailMx);
+			if(FailMsg.empty())
+				FailMsg = "分段未拉完（网络中断）";
+			Failed++;
+		}
+	};
+
+	std::vector<std::thread> Th;
+	Th.reserve(N);
+	for(int i = 0; i < N; ++i)
+		Th.emplace_back(Worker, i);
+
+	// 主线程只做一件事：每 0.4 秒报一次总进度（回调不在工作线程里调，避免多线程怼 UI）
+	while(true)
+	{
+		if(pCancel && pCancel->load())
+			break;
+		if(Failed.load() > 0)
+			break;
+		const int64_t D = Done.load();
+		if(Progress)
+			Progress(D, Total);
+		if(D >= Total)
+			break;
+		Sleep(400);
+	}
+	for(auto &T : Th)
+		if(T.joinable())
+			T.join();
+
+	if(pCancel && pCancel->load())
+	{
+		DeleteFileW(Utf8ToWide(DestPath).c_str());
+		R.Error = "已取消";
+		return R;
+	}
+	if(Failed.load() > 0 || Done.load() < Total)
+	{
+		Say("  多线程下载失败（" + (FailMsg.empty() ? std::string("未完成") : FailMsg) + "），已改用单连接重试");
+		DeleteFileW(Utf8ToWide(DestPath).c_str());
+		return DownloadFile(Url, DestPath, Progress);
+	}
+	if(Progress)
+		Progress(Total, Total);
+	R.Ok = true;
+	R.Status = 206;
 	return R;
 }
 

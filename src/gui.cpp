@@ -19,9 +19,11 @@ namespace
 	const int IDC_SOURCE = 1001, IDC_REFRESH = 1002, IDC_VERSIONS = 1003, IDC_MODULES = 1004;
 	const int IDC_WORKDIR = 1005, IDC_BROWSE = 1006, IDC_MIRROR = 1007;
 	const int IDC_BUILD = 1009, IDC_INSTALL = 1010, IDC_CANCEL = 1011, IDC_OPENDIR = 1012;
+	const int IDC_CLEAN = 1023, IDC_REFMODS = 1024;   // 一键清理 src\ / 刷新 mods\ 模块列表
 	const int IDC_PROGRESS = 1013, IDC_LOG = 1014, IDC_STATUS = 1015, IDC_UPDATE = 1016;
 	const int IDC_SRCLIST = 1017;
 	const int IDC_MIRRORHOST = 1018, IDC_PROXY = 1019, IDC_PROXYADDR = 1020;
+	const int IDC_MT = 1021, IDC_MTCOUNT = 1022;   // 多线程下载（NDM 式分段多连接）
 
 	const UINT WM_APP_LOG = WM_APP + 1;
 	const UINT WM_APP_DONE = WM_APP + 2;
@@ -43,7 +45,9 @@ namespace
 
 	HWND g_hMain, g_hSource, g_hRefresh, g_hVersions, g_hModules, g_hWorkDir, g_hBrowse, g_hMirror;
 	HWND g_hMirrorHost, g_hProxy, g_hProxyAddr;
+	HWND g_hMt, g_hMtCount;   // 多线程下载
 	HWND g_hBuild, g_hInstall, g_hCancel, g_hOpenDir, g_hProgress, g_hLog, g_hStatus, g_hUpdate;
+	HWND g_hClean, g_hRefMods;
 	HWND g_hLabel1, g_hLabel2, g_hLabel3;
 
 	const wchar_t *CHECK = L"\u2714";   // ✔
@@ -98,6 +102,8 @@ namespace
 		EnableWindow(g_hInstall, !Busy);
 		EnableWindow(g_hRefresh, !Busy);
 		EnableWindow(g_hUpdate, !Busy);
+		EnableWindow(g_hClean, !Busy);     // 安装进行中不能删 src\（正在用）
+		EnableWindow(g_hRefMods, !Busy);
 		EnableWindow(g_hCancel, Busy);
 		SendMessageW(g_hProgress, PBM_SETMARQUEE, FALSE, 0);   // 每轮都从"确定式"开始
 		if(Busy)
@@ -112,6 +118,89 @@ namespace
 	}
 
 	// --------------------------------------------------------------- 填充 ----
+	// 扫描 mods\*.dmod 并合并进模块列表（替换同 id 旧版）。启动与「刷新模块」共用。
+	int ScanModsFolder()
+	{
+		std::string ModsDir = JoinPath(ExeDir(), "mods");
+		MakeDirs(ModsDir);
+		std::string CacheDir = JoinPath(ExeDir(), "_mods");
+		int LoadedMods = 0;
+		WIN32_FIND_DATAW Fd;
+		HANDLE Hf = FindFirstFileW(Utf8ToWide(JoinPath(ModsDir, "*.dmod")).c_str(), &Fd);
+		if(Hf != INVALID_HANDLE_VALUE)
+		{
+			do {
+				std::string Name = WideToUtf8(Fd.cFileName);
+				if(Name == "." || Name == "..")
+					continue;
+				ModuleInfo M;
+				std::string Err;
+				if(LoadDmodFile(JoinPath(ModsDir, Name), CacheDir, M, Err))
+				{
+					bool Replaced = false;
+					for(auto &X : g_Index.Modules)
+						if(X.Id == M.Id)
+						{
+							X = M;
+							Replaced = true;
+							break;
+						}
+					if(!Replaced)
+						g_Index.Modules.push_back(M);
+					LoadedMods++;
+				}
+				else
+					AppendLog("[x] 单文件 mod 加载失败 " + Name + "：" + Err);
+			} while(FindNextFileW(Hf, &Fd));
+			FindClose(Hf);
+		}
+		return LoadedMods;
+	}
+
+	// 递归统计目录大小（给"清理源码"报告释放了多少空间）
+	uint64_t DirSizeBytes(const std::string &Dir)
+	{
+		uint64_t Total = 0;
+		WIN32_FIND_DATAW Fd;
+		HANDLE H = FindFirstFileW(Utf8ToWide(JoinPath(Dir, "*")).c_str(), &Fd);
+		if(H == INVALID_HANDLE_VALUE)
+			return 0;
+		do {
+			std::string Name = WideToUtf8(Fd.cFileName);
+			if(Name == "." || Name == "..")
+				continue;
+			if(Fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+				Total += DirSizeBytes(JoinPath(Dir, Name));
+			else
+				Total += ((uint64_t)Fd.nFileSizeHigh << 32) | Fd.nFileSizeLow;
+		} while(FindNextFileW(H, &Fd));
+		FindClose(H);
+		return Total;
+	}
+
+	void WorkerCleanSrc()
+	{
+		SetBusy(true);
+		std::string SrcDir = JoinPath(g_Installer.AppDir, "src");
+		if(!PathExists(SrcDir))
+		{
+			LogBridge(LogLevel::Info, "src\\ 不存在，没有可清理的内容");
+			PostMessageW(g_hMain, WM_APP_DONE, 3, 0);
+			return;
+		}
+		LogBridge(LogLevel::Info, "正在清理源码与构建产物（文件很多，可能要几秒到几十秒）…");
+		uint64_t Bytes = DirSizeBytes(SrcDir);
+		char Buf[64];
+		snprintf(Buf, sizeof(Buf), "%.2f GB", Bytes / 1073741824.0);
+		bool Ok = RemoveTree(SrcDir);
+		MakeDirs(SrcDir);   // 目录保留（固定布局：src\ 由安装流程继续使用）
+		if(Ok)
+			LogBridge(LogLevel::Info, std::string("已清理 src\\（源码 + 构建，释放约 ") + Buf + "）；下次安装会重新克隆");
+		else
+			LogBridge(LogLevel::Error, "清理 src\\ 没删干净（可能有文件被占用，可关闭占用程序后再点一次）");
+		PostMessageW(g_hMain, WM_APP_DONE, 3, 0);
+	}
+
 	void FillSources()
 	{
 		SendMessageW(g_hSource, CB_RESETCONTENT, 0, 0);
@@ -274,6 +363,22 @@ namespace
 		EnableWindow(g_hProxyAddr, Px ? TRUE : FALSE);
 	}
 
+	// 多线程下载热生效（用户要求"能热改线程数"）：勾选状态或输入框一变就写全局提示值，
+	// 安装工作线程每次开始下载一个文件时读它——改完对下一个文件立即生效。
+	void UpdateHotThreads()
+	{
+		int T = 1;
+		if(SendMessageW(g_hMt, BM_GETCHECK, 0, 0) == BST_CHECKED)
+		{
+			T = atoi(CtlText(g_hMtCount).c_str());
+			if(T < 2)
+				T = 2;
+			if(T > 16)
+				T = 16;
+		}
+		g_DlThreadsHint.store(T);
+	}
+
 	std::string NetSummary()
 	{
 		const std::string Host = SelectedMirrorHost();
@@ -356,9 +461,21 @@ namespace
 		Opt.InstallFfmpeg = ModulesNeedFfmpeg(Opt.Modules);
 		// 代理也要带给 git（clone / fetch / submodule 都是子进程）
 		Opt.Proxy = g_Installer.Net.Proxy;
+		// 多线程下载：勾选才用；线程数取下拉框里的值（2~16，填别的会被夹到范围内）
+		Opt.DownloadThreads = 1;
+		if(SendMessageW(g_hMt, BM_GETCHECK, 0, 0) == BST_CHECKED)
+		{
+			Opt.DownloadThreads = atoi(CtlText(g_hMtCount).c_str());
+			if(Opt.DownloadThreads < 2)
+				Opt.DownloadThreads = 2;
+			if(Opt.DownloadThreads > 16)
+				Opt.DownloadThreads = 16;
+		}
+		g_DlThreadsHint.store(Opt.DownloadThreads);   // 热线程数以本次安装开始时的值为起点
 
 		LogBridge(LogLevel::Step, "开始安装：" + Opt.Source.Name + " @" + Opt.Version.Ref +
-					      "，模块 " + std::to_string(Opt.Modules.size()) + " 个；网络：" + NetSummary());
+					      "，模块 " + std::to_string(Opt.Modules.size()) + " 个；网络：" + NetSummary() +
+					      "；下载线程：" + std::to_string(Opt.DownloadThreads));
 		if(Opt.Modules.empty())
 			LogBridge(LogLevel::Warn, "没有勾选任何模块：只会装一份干净的客户端源码");
 		if(Opt.InstallFfmpeg)
@@ -415,6 +532,8 @@ namespace
 		MoveWindow(g_hProxy, LeftX + 316, Y2 + 22, 90, 24, TRUE);
 		MoveWindow(g_hProxyAddr, LeftX + 410, Y2 + 23, 170, 22, TRUE);
 		MoveWindow(g_hBuild, LeftX, Y2 + 54, 110, 24, TRUE);
+		MoveWindow(g_hMt, LeftX + 122, Y2 + 54, 110, 24, TRUE);
+		MoveWindow(g_hMtCount, LeftX + 240, Y2 + 54, 80, 200, TRUE);   // 可编辑下拉：2/4/8/16 或自填
 
 		// 按钮 + 进度
 		int Y3 = Y2 + 94;
@@ -422,8 +541,10 @@ namespace
 		MoveWindow(g_hCancel, LeftX + 118, Y3, 80, 28, TRUE);
 		MoveWindow(g_hUpdate, LeftX + 206, Y3, 90, 28, TRUE);
 		MoveWindow(g_hOpenDir, LeftX + 304, Y3, 110, 28, TRUE);
-		MoveWindow(g_hProgress, LeftX + 424, Y3 + 2, W - M * 2 - 424, 18, TRUE);
-		MoveWindow(g_hProgText, LeftX + 424, Y3 + 22, W - M * 2 - 424, 16, TRUE);
+		MoveWindow(g_hClean, LeftX + 422, Y3, 92, 28, TRUE);
+		MoveWindow(g_hRefMods, LeftX + 522, Y3, 92, 28, TRUE);
+		MoveWindow(g_hProgress, LeftX + 622, Y3 + 2, W - M * 2 - 622, 18, TRUE);
+		MoveWindow(g_hProgText, LeftX + 622, Y3 + 22, W - M * 2 - 622, 16, TRUE);
 
 		int Y4 = Y3 + 44;
 		int LogH = Hh - Y4 - 52;
@@ -469,34 +590,46 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 			ListView_InsertColumn(g_hModules, 4, &C);
 		}
 
-		g_hLabel3 = CreateWindowW(L"STATIC", L"安装布局（强制、固定在本程序目录下）：mods\\ 放 mod，src\\ 放拉取的源码与构建，client\\ 放构建好的客户端；FFmpeg 由模块依赖自动决定", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, H, nullptr, nullptr, nullptr);
+		g_hLabel3 = CreateWindowW(L"STATIC", L"安装布局（强制、固定在本程序目录下）：mods\\ 放 mod，src\\ 放拉取的源码与构建，client\\<种类>-<版本>\\ 放构建好的客户端（按客户端与版本分目录，互不覆盖）；FFmpeg 由模块依赖自动决定", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, H, nullptr, nullptr, nullptr);
 		g_hMirror = CreateWindowW(L"BUTTON", L"国内镜像", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_MIRROR, nullptr, nullptr);
 		// 镜像地址可选：下拉里给两个实测能用的，也可以直接改/自填（可编辑下拉框）
 		g_hMirrorHost = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | WS_VSCROLL | CBS_AUTOHSCROLL, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_MIRRORHOST, nullptr, nullptr);
+		SendMessageW(g_hMirrorHost, CB_ADDSTRING, 0, (LPARAM)L"gh.meali.top");
 		SendMessageW(g_hMirrorHost, CB_ADDSTRING, 0, (LPARAM)L"ghproxy.net");
 		SendMessageW(g_hMirrorHost, CB_ADDSTRING, 0, (LPARAM)L"hk.gh-proxy.org");
-		SetWindowTextW(g_hMirrorHost, L"ghproxy.net");
+		SetWindowTextW(g_hMirrorHost, L"gh.meali.top");
 		g_hProxy = CreateWindowW(L"BUTTON", L"使用代理", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_PROXY, nullptr, nullptr);
 		g_hProxyAddr = CreateWindowW(L"EDIT", L"127.0.0.1:7890", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_PROXYADDR, nullptr, nullptr);
 		g_hBuild = CreateWindowW(L"BUTTON", L"自动编译", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_BUILD, nullptr, nullptr);
+		// 多线程下载（NDM 式）：勾选后用 HTTP Range 分段多连接拉取大文件（FFmpeg 等）
+		g_hMt = CreateWindowW(L"BUTTON", L"多线程下载", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_MT, nullptr, nullptr);
+		g_hMtCount = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | WS_VSCROLL | CBS_AUTOHSCROLL, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_MTCOUNT, nullptr, nullptr);
+		for(const wchar_t *N : {L"2", L"4", L"8", L"16"})
+			SendMessageW(g_hMtCount, CB_ADDSTRING, 0, (LPARAM)N);
+		SetWindowTextW(g_hMtCount, L"4");
 
 		g_hInstall = CreateWindowW(L"BUTTON", L"开始安装", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_INSTALL, nullptr, nullptr);
 		g_hCancel = CreateWindowW(L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_CANCEL, nullptr, nullptr);
 		g_hUpdate = CreateWindowW(L"BUTTON", L"检查更新", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_UPDATE, nullptr, nullptr);
 		g_hOpenDir = CreateWindowW(L"BUTTON", L"打开安装目录", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_OPENDIR, nullptr, nullptr);
+		g_hClean = CreateWindowW(L"BUTTON", L"清理源码", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_CLEAN, nullptr, nullptr);
+		g_hRefMods = CreateWindowW(L"BUTTON", L"刷新模块", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_REFMODS, nullptr, nullptr);
 		g_hProgress = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE | PBS_MARQUEE, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_PROGRESS, nullptr, nullptr);
 		g_hProgText = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS, 0, 0, 0, 0, H, nullptr, nullptr, nullptr);
 		g_hLog = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
 		g_hStatus = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_STATUS, nullptr, nullptr);
 
-		for(HWND Ctl : {g_hSource, g_hRefresh, g_hVersions, g_hModules, g_hMirror, g_hMirrorHost, g_hProxy, g_hProxyAddr, g_hBuild,
-			     g_hInstall, g_hCancel, g_hUpdate, g_hOpenDir, g_hLog, g_hStatus, g_hLabel1, g_hLabel2, g_hLabel3, g_hProgText})
+		for(HWND Ctl : {g_hSource, g_hRefresh, g_hVersions, g_hModules, g_hMirror, g_hMirrorHost, g_hProxy, g_hProxyAddr, g_hBuild, g_hMt, g_hMtCount,
+			     g_hInstall, g_hCancel, g_hUpdate, g_hOpenDir, g_hClean, g_hRefMods, g_hLog, g_hStatus, g_hLabel1, g_hLabel2, g_hLabel3, g_hProgText})
 			SendMessageW(Ctl, WM_SETFONT, (WPARAM)Font, TRUE);
 
 		CheckDlgButton(H, IDC_MIRROR, BST_CHECKED);
 		CheckDlgButton(H, IDC_BUILD, BST_CHECKED);
+		CheckDlgButton(H, IDC_MT, BST_CHECKED);
+		EnableWindow(g_hMtCount, TRUE);
+		AppendLog("[i] 多线程下载：默认开（4 线程，可改 2/4/8/16 或自己填）；服务端不支持 HTTP Range 会自动退回单连接");
 		SyncNetControls(false);   // 初始：镜像开、代理关（代理勾选框始终可点）
-		AppendLog("[i] 网络选项：镜像 ghproxy.net（下拉可选 hk.gh-proxy.org，也可改成别的）与代理 127.0.0.1:7890 是两条替代路线——**勾了代理会自动关掉并变灰镜像**，关掉代理时镜像恢复默认开");
+		AppendLog("[i] 网络选项：镜像 gh.meali.top（下拉可选 ghproxy.net / hk.gh-proxy.org，也可改成别的）与代理 127.0.0.1:7890 是两条替代路线——**勾了代理会自动关掉并变灰镜像**，关掉代理时镜像恢复默认开");
 		AppendLog("[i] 注意：不勾代理时按 Windows 系统设置走——系统代理开着（如 Clash 的 127.0.0.1:7890）就会经它；被限流/不可用时会自动绕过所有代理直连重试");
 		DragAcceptFiles(H, TRUE);   // 支持把 .dmod 拖进窗口添加
 		SetStatus(std::string("v") + kInstallerVersion + " 就绪");
@@ -543,41 +676,9 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 
 		// 单文件 mod：<exe>\mods\*.dmod（也可以直接把 .dmod 拖进本窗口添加）
 		{
-			std::string ModsDir = JoinPath(ExeDir(), "mods");
-			MakeDirs(ModsDir);
-			std::string CacheDir = JoinPath(ExeDir(), "_mods");
-			int LoadedMods = 0;
-			WIN32_FIND_DATAW Fd;
-			HANDLE Hf = FindFirstFileW(Utf8ToWide(JoinPath(ModsDir, "*.dmod")).c_str(), &Fd);
-			if(Hf != INVALID_HANDLE_VALUE)
-			{
-				do {
-					std::string Name = WideToUtf8(Fd.cFileName);
-					if(Name == "." || Name == "..")
-						continue;
-					ModuleInfo M;
-					std::string Err;
-					if(LoadDmodFile(JoinPath(ModsDir, Name), CacheDir, M, Err))
-					{
-						bool Replaced = false;
-						for(auto &X : g_Index.Modules)
-							if(X.Id == M.Id)
-							{
-								X = M;
-								Replaced = true;
-								break;
-							}
-						if(!Replaced)
-							g_Index.Modules.push_back(M);
-						LoadedMods++;
-					}
-					else
-						AppendLog("[x] 单文件 mod 加载失败 " + Name + "：" + Err);
-				} while(FindNextFileW(Hf, &Fd));
-				FindClose(Hf);
-			}
+			int LoadedMods = ScanModsFolder();
 			if(LoadedMods > 0)
-				AppendLog("[i] 已加载单文件 mod " + std::to_string(LoadedMods) + " 个（" + ModsDir + "\\*.dmod）");
+				AppendLog("[i] 已加载单文件 mod " + std::to_string(LoadedMods) + " 个（" + JoinPath(ExeDir(), "mods") + "\\*.dmod）");
 			else
 				AppendLog("[i] 还没有单文件 mod —— 把 .dmod 文件直接拖进本窗口即可添加");
 		}
@@ -637,6 +738,21 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		if(Id == IDC_INSTALL || Id == IDC_REFRESH) WriteHostNote(Id == IDC_INSTALL ? "收到点击：开始安装" : "收到点击：刷新版本");
 		if(Id == IDC_REFRESH)
 			StartWorker(WorkerRefresh);
+		else if(Id == IDC_CLEAN)
+			StartWorker(WorkerCleanSrc);
+		else if(Id == IDC_REFMODS)
+		{
+			// 手动刷新 mods\：清掉来自 mods\ 的条目再重扫（modules.json 来的不受影响）
+			for(size_t i = g_Index.Modules.size(); i-- > 0;)
+				if(g_Index.Modules[i].Origin.rfind("mods\\", 0) == 0)
+					g_Index.Modules.erase(g_Index.Modules.begin() + i);
+			int Loaded = ScanModsFolder();
+			FillModules();
+			if(Loaded > 0)
+				AppendLog("[i] 模块列表已刷新：从 mods\\ 加载 " + std::to_string(Loaded) + " 个 .dmod");
+			else
+				AppendLog("[i] 模块列表已刷新：mods\\ 里当前没有 .dmod");
+		}
 		else if(Id == IDC_UPDATE)
 			StartWorker(WorkerUpdateCheck);
 		else if(Id == IDC_INSTALL)
@@ -652,6 +768,13 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 			SyncNetControls(false);
 		else if(Id == IDC_PROXY && HIWORD(W) == BN_CLICKED)
 			SyncNetControls(true);
+		else if(Id == IDC_MT && HIWORD(W) == BN_CLICKED)
+		{
+			EnableWindow(g_hMtCount, SendMessageW(g_hMt, BM_GETCHECK, 0, 0) == BST_CHECKED);
+			UpdateHotThreads();   // 热生效：勾/取消多线程立即影响下一个下载
+		}
+		else if(Id == IDC_MTCOUNT && HIWORD(W) == EN_CHANGE)
+			UpdateHotThreads();   // 热生效：安装进行中改线程数，下一个文件就用新值
 		else if(Id == IDC_BROWSE)
 		{
 			BROWSEINFOW Bi = {};
@@ -736,6 +859,69 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
 {
+	// 开发/自检用（不进 GUI，方便核对多线程下载的字节数与哈希）：
+	//   ddnet-module-installer.exe --download <url> <保存路径> [线程数] [限时秒] [--proxy 地址]
+	// 注意本程序是 WIN32(GUI) 子系统，没有 stdout，printf 的结果看不见；
+	// 所以结果同时写入 <保存路径>.dl-result.txt（自动化自检读这个文件）。
+	{
+		int Argc = 0;
+		LPWSTR *Argv = CommandLineToArgvW(GetCommandLineW(), &Argc);
+		if(Argv && Argc >= 4 && _wcsicmp(Argv[1], L"--download") == 0)
+		{
+			const std::string Url = WideToUtf8(Argv[2]);
+			const std::string Dest = WideToUtf8(Argv[3]);
+			const int Th = (Argc >= 5) ? _wtoi(Argv[4]) : 1;
+			const int LimitSec = (Argc >= 6) ? _wtoi(Argv[5]) : 0;   // 可选：跑 N 秒就停（测速用）
+			std::string Proxy;
+			for(int i = 6; i < Argc; ++i)   // 可选开关：--proxy <host:port>
+				if(_wcsicmp(Argv[i], L"--proxy") == 0 && i + 1 < Argc)
+					Proxy = WideToUtf8(Argv[++i]);
+			LocalFree(Argv);
+			Http H;
+			H.Proxy = Proxy;   // 空 = 按 Windows 系统代理设置走（PRECONFIG）
+			std::atomic<bool> Stop{false};
+			if(LimitSec > 0)
+				H.pCancel = &Stop;
+			const auto T0 = std::chrono::steady_clock::now();
+			int64_t LastShown = 0;
+			int64_t LastGot = 0;
+			auto Cb = [&](int64_t Got, int64_t Total) {
+				LastGot = Got;
+				if(LimitSec > 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count() >= LimitSec)
+					Stop = true;
+				if(Got - LastShown >= 4 * 1024 * 1024 || Got == Total)
+				{
+					LastShown = Got;
+					printf("  %lld / %lld bytes\n", (long long)Got, (long long)Total);
+				}
+			};
+			HttpResult R;
+			if(Th > 1)
+				R = H.DownloadFileMulti(Url, Dest, Th, Cb, [](const std::string &S) { printf("%s\n", S.c_str()); });
+			else
+				R = H.DownloadFile(Url, Dest, Cb);
+			const double Sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count();
+			char Line[640];
+			snprintf(Line, sizeof(Line), "result: ok=%d status=%d err=%s seconds=%.2f bytes=%lld rate=%.2f MB/s threads=%d proxy=%s",
+				R.Ok ? 1 : 0, R.Status, R.Error.empty() ? "-" : R.Error.c_str(), Sec, (long long)LastGot,
+				Sec > 0 ? LastGot / 1048576.0 / Sec : 0.0, Th, Proxy.empty() ? "(system)" : Proxy.c_str());
+			printf("%s\n", Line);
+			{
+				std::string Rf = Dest + ".dl-result.txt";
+				FILE *F = nullptr;
+				if(fopen_s(&F, Rf.c_str(), "wb") == 0 && F)
+				{
+					fwrite(Line, 1, strlen(Line), F);
+					fprintf(F, "\n");
+					fclose(F);
+				}
+			}
+			return R.Ok ? 0 : 1;
+		}
+		if(Argv)
+			LocalFree(Argv);
+	}
+
 	INITCOMMONCONTROLSEX Icc = {sizeof(Icc), ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES | ICC_BAR_CLASSES};
 	InitCommonControlsEx(&Icc);
 

@@ -43,6 +43,11 @@ struct Http
 	// 下载到文件，带进度回调（已下载字节，总字节；总字节可能为 -1）
 	HttpResult DownloadFile(const std::string &Url, const std::string &DestPath,
 		const std::function<void(int64_t, int64_t)> &Progress) const;
+	// 多线程分段下载（NDM 式）：Threads>=2 且服务端支持 HTTP Range 时开多个连接并行取分段，
+	// 每段都能断点续传；不支持分段或分段失败会自动退回单连接。Note 用来说明实际发生了什么。
+	HttpResult DownloadFileMulti(const std::string &Url, const std::string &DestPath, int Threads,
+		const std::function<void(int64_t, int64_t)> &Progress,
+		const std::function<void(const std::string &)> &Note) const;
 };
 
 // ------------------------------------------------------------------- json ---
@@ -163,6 +168,7 @@ struct InstallOptions
 	std::vector<ModuleInfo> Modules;
 	// 网络：镜像前缀走 Net.MirrorPrefix；这里只放代理（git 与 HTTP 都走它）
 	std::string Proxy;            // 空 = 不用代理；否则形如 "127.0.0.1:7890"
+	int DownloadThreads = 1;      // HTTP 下载线程数（1 = 单连接；>1 走 Range 分段多连接）
 	bool SkipSubmodules = false;
 	bool InstallFfmpeg = true;
 	std::string FfmpegZip;        // 空则自动下载
@@ -194,6 +200,16 @@ bool IsDir(const std::string &P);
 bool MakeDirs(const std::string &P);
 bool CopyTree(const std::string &From, const std::string &To, std::string &Error);
 bool RemoveTree(const std::string &P);
+// 完整性校验：把构建输出目录（如 build\Release）里编出来的运行时 DLL 全部带上
+//（TClient 本地构建的 steam_api.dll 就在那里，不带会导致启动报"找不到 steam_api.dll"）
+bool CollectRuntimeDlls(const std::string &BuildDir, const std::string &Dist, int &Copied, std::string &Error);
+// 完整性校验：解析 exe 的 PE 导入表，核对每个非系统 DLL 依赖是否在 Dir 里。
+// 返回 true=全部就绪；false=内部错误（Error 说明）或有缺失（Missing 列出 DLL 名）。
+bool VerifyExeImports(const std::string &ExePath, const std::string &Dir,
+		      std::vector<std::string> &Missing, std::string &Error);
+// 多线程下载的"热"线程数：安装进行中改 UI 输入框立即写这里，每次下载开始时读一次，
+// 对下一个要下载的文件立即生效（已经在分的段落不变）。0 = 没有提示值，用本次安装的快照。
+extern std::atomic<int> g_DlThreadsHint;
 std::string ExeDir();
 std::string WideToUtf8(const std::wstring &W);
 std::wstring Utf8ToWide(const std::string &S);
