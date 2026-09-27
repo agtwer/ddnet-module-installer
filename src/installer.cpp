@@ -1226,9 +1226,10 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 	OutState.Modules.clear();
 	for(const auto &M : Opt.Modules)
 		OutState.Modules.push_back(M.Id + "@" + (M.Version.empty() ? "?" : M.Version));
-	// 安装记录与日志同在 debug 子目录，避免程序根目录散落文件
-	MakeDirs(JoinPath(AppDir, "debug"));
-	InstallState::Save(JoinPath(JoinPath(AppDir, "debug"), "install-state.json"), OutState);
+	// 安装记录与日志同在 `.ddnet\debug` 子目录：程序根目录只允许有 .ddnet 与 exe
+	const std::string DebugDir = JoinPath(JoinPath(AppDir, ".ddnet"), "debug");
+	MakeDirs(DebugDir);
+	InstallState::Save(JoinPath(DebugDir, "install-state.json"), OutState);
 	Step(StepNo++, std::string("完成") + (FfmpegInstalled ? "（含视频支持）" : "（未装 FFmpeg：仅图片）"));
 	Report(100, std::string("完成") + (FfmpegInstalled ? "（含视频支持）" : "（未装 FFmpeg：仅图片）") + " → " + Dist);
 	return true;

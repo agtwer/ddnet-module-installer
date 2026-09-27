@@ -81,7 +81,7 @@ namespace
 			SendMessageW(g_hLog, EM_SETSEL, 0, kTrimToChars);
 			SendMessageW(g_hLog, WM_CLEAR, 0, 0);
 			SendMessageW(g_hLog, EM_SETSEL, -1, -1);
-			SendMessageW(g_hLog, EM_REPLACESEL, FALSE, (LPARAM)L"[… 已省略较早的日志（完整内容见 debug\\installer.log）]\r\n");
+			SendMessageW(g_hLog, EM_REPLACESEL, FALSE, (LPARAM)L"[… 已省略较早的日志（完整内容见 .ddnet\\debug\\installer.log）]\r\n");
 		}
 		int Len = GetWindowTextLengthW(g_hLog);
 		SendMessageW(g_hLog, EM_SETSEL, Len, Len);
@@ -98,7 +98,7 @@ namespace
 		std::string Text = g_LogFile.empty() ? std::string() : ReadFileText(g_LogFile, Ok);
 		if(!Ok || Text.empty())
 		{
-			AppendLog("[i] 没有可显示的日志文件（debug\\installer.log 为空或不存在）");
+			AppendLog("[i] 没有可显示的日志文件（.ddnet\\debug\\installer.log 为空或不存在）");
 			return;
 		}
 		// 只取尾部，避免把巨大日志整段塞进控件
@@ -109,7 +109,7 @@ namespace
 			const size_t Nl = Text.find('\n', Cut);
 			if(Nl != std::string::npos)
 				Cut = Nl + 1;
-			Text = "[… 只显示日志末尾部分，完整内容见 debug\\installer.log]\r\n" + Text.substr(Cut);
+			Text = "[… 只显示日志末尾部分，完整内容见 .ddnet\\debug\\installer.log]\r\n" + Text.substr(Cut);
 		}
 		SetWindowTextW(g_hLog, Utf8ToWide(Text).c_str());
 		// 停留在最下面（最新内容）。注意：SetWindowTextW 会把滚动位置重置回顶部，而且
@@ -576,7 +576,7 @@ namespace
 		SetBusy(true);
 		ApplyNetSettings();
 		if(!g_HasState)
-			LogBridge(LogLevel::Warn, "本机还没有安装记录（debug\\install-state.json），先安装一次再看更新");
+			LogBridge(LogLevel::Warn, "本机还没有安装记录（.ddnet\\debug\\install-state.json），先安装一次再看更新");
 		else
 		{
 			LogBridge(LogLevel::Step, "检查更新：本机已装 " + g_State.SourceId + " @" + g_State.Version + "（" + NetSummary() + "）");
