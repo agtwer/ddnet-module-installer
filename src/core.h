@@ -112,6 +112,8 @@ struct ModuleInfo
 	std::string PatchUrl;        // 远端补丁
 	std::string PatchLocal;      // 相对程序目录的本地补丁（可空）
 	std::string PatchPath;       // 已解析出的补丁绝对路径（来自 .dmod 时自动填）
+	std::map<std::string, std::string> Patches;   // 按来源 id 的补丁: {"tclient":"patch/module.patch","ddnet":"patch/ddnet-background.patch"}
+	std::string ResolvedPatch;   // 本次选用（已按来源 id 解析）的补丁相对路径
 	std::string DmodPath;        // 来源 .dmod 文件（可空）
 	std::string Origin;          // 人类可读来源：mods/xxx.dmod 或 modules/modules.json
 	std::string DocsUrl;
@@ -142,6 +144,7 @@ bool LoadDmodFile(const std::string &DmodPath, const std::string &TempRoot, Modu
 bool IsDmodFile(const std::string &Path);
 std::string FileNameOf(const std::string &Path);
 std::string ReadFileText(const std::string &Path, bool &Ok);
+bool WriteFileText(const std::string &Path, const std::string &Text);   // 用于源码树里的"已打补丁"标记
 
 // ------------------------------------------------------------------- state ---
 struct InstallState
@@ -173,6 +176,10 @@ struct InstallOptions
 	bool InstallFfmpeg = true;
 	std::string FfmpegZip;        // 空则自动下载
 	bool Build = true;
+	// 调试安装：把游戏存档（settings.cfg/截图/背景等）留在游戏目录的 save\ 里，
+	// 而不是系统 AppData。实现方式 = 组装时把 storage.cfg 的第一条（决定存档位置）
+	// 从 $USERDIR 改成 save。
+	bool DebugSaveInGameDir = false;
 	std::string CmakePath = "cmake";
 	std::string GitPath = "git";
 	std::string Config = "Release";

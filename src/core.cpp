@@ -1335,6 +1335,16 @@ std::string ReadFileText(const std::string &Path, bool &Ok)
 	return Text;
 }
 
+bool WriteFileText(const std::string &Path, const std::string &Text)
+{
+	FILE *F = nullptr;
+	if(fopen_s(&F, Path.c_str(), "wb") != 0 || !F)
+		return false;
+	size_t Written = Text.empty() ? 0 : fwrite(Text.data(), 1, Text.size(), F);
+	fclose(F);
+	return Written == Text.size();
+}
+
 // .dmod = 一个 zip 容器（内含 module.json + 补丁 + 可选 files/docs），
 // 用系统自带 tar.exe 解开，因此不需要任何 zip 库。
 bool LoadDmodFile(const std::string &DmodPath, const std::string &TempRoot, ModuleInfo &Out, std::string &Error)
@@ -1389,6 +1399,13 @@ bool LoadDmodFile(const std::string &DmodPath, const std::string &TempRoot, Modu
 				Out.Verified[KV.first] = KV.second.Bool;
 	Out.VerifyPath = Root.GetString("verify_path");
 	std::string PatchRel = Root.GetString("patch", "patch/module.patch");
+	// 多基线补丁：patches{"tclient": "...", "ddnet": "..."}——同一个模块给不同上游基线各带一份补丁，
+	// 安装时按当前来源 id 选（没有对应项或没写 patches 就用默认 patch）。
+	if(const JsonValue *Ps = Root.Find("patches"); Ps && Ps->T == JsonValue::Type::Object)
+		for(const auto &KV : Ps->Obj)
+			if(KV.second.T == JsonValue::Type::String)
+				Out.Patches[KV.first] = JoinPath(Dir, KV.second.Str);   // 绝对路径，便于直接选用
+	Out.ResolvedPatch = PatchRel;
 	Out.PatchPath = JoinPath(Dir, PatchRel);
 	Out.DmodPath = DmodPath;
 	Out.Origin = "mods\\" + Name;

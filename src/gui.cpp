@@ -20,6 +20,7 @@ namespace
 	const int IDC_WORKDIR = 1005, IDC_BROWSE = 1006, IDC_MIRROR = 1007;
 	const int IDC_BUILD = 1009, IDC_INSTALL = 1010, IDC_CANCEL = 1011, IDC_OPENDIR = 1012;
 	const int IDC_CLEAN = 1023, IDC_REFMODS = 1024;   // 一键清理 src\ / 刷新 mods\ 模块列表
+	const int IDC_DEBUGSAVE = 1025;                   // 调试安装：存档放游戏目录的 save 文件夹
 	const int IDC_PROGRESS = 1013, IDC_LOG = 1014, IDC_STATUS = 1015, IDC_UPDATE = 1016;
 	const int IDC_SRCLIST = 1017;
 	const int IDC_MIRRORHOST = 1018, IDC_PROXY = 1019, IDC_PROXYADDR = 1020;
@@ -47,7 +48,7 @@ namespace
 	HWND g_hMirrorHost, g_hProxy, g_hProxyAddr;
 	HWND g_hMt, g_hMtCount;   // 多线程下载
 	HWND g_hBuild, g_hInstall, g_hCancel, g_hOpenDir, g_hProgress, g_hLog, g_hStatus, g_hUpdate;
-	HWND g_hClean, g_hRefMods;
+	HWND g_hClean, g_hRefMods, g_hDebugSave;
 	HWND g_hLabel1, g_hLabel2, g_hLabel3;
 
 	const wchar_t *CHECK = L"\u2714";   // ✔
@@ -474,6 +475,7 @@ namespace
 		}
 		Opt.Version = g_Versions[V];
 		Opt.Build = SendMessageW(g_hBuild, BM_GETCHECK, 0, 0) == BST_CHECKED;
+		Opt.DebugSaveInGameDir = SendMessageW(g_hDebugSave, BM_GETCHECK, 0, 0) == BST_CHECKED;
 		Opt.Modules = SelectedModules();
 		// FFmpeg 不再是独立开关：由所选模块的 requires 决定（background 需要 ffmpeg8.1）
 		Opt.InstallFfmpeg = ModulesNeedFfmpeg(Opt.Modules);
@@ -550,8 +552,9 @@ namespace
 		MoveWindow(g_hProxy, LeftX + 316, Y2 + 22, 90, 24, TRUE);
 		MoveWindow(g_hProxyAddr, LeftX + 410, Y2 + 23, 170, 22, TRUE);
 		MoveWindow(g_hBuild, LeftX, Y2 + 54, 110, 24, TRUE);
-		MoveWindow(g_hMt, LeftX + 122, Y2 + 54, 110, 24, TRUE);
-		MoveWindow(g_hMtCount, LeftX + 240, Y2 + 54, 80, 200, TRUE);   // 可编辑下拉：2/4/8/16 或自填
+		MoveWindow(g_hDebugSave, LeftX + 122, Y2 + 54, 232, 24, TRUE);   // 调试安装：存档放游戏目录
+		MoveWindow(g_hMt, LeftX + 364, Y2 + 54, 110, 24, TRUE);
+		MoveWindow(g_hMtCount, LeftX + 482, Y2 + 54, 80, 200, TRUE);   // 可编辑下拉：2/4/8/16 或自填
 
 		// 按钮 + 进度
 		int Y3 = Y2 + 94;
@@ -619,6 +622,8 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		g_hProxy = CreateWindowW(L"BUTTON", L"使用代理", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_PROXY, nullptr, nullptr);
 		g_hProxyAddr = CreateWindowW(L"EDIT", L"127.0.0.1:7890", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_PROXYADDR, nullptr, nullptr);
 		g_hBuild = CreateWindowW(L"BUTTON", L"自动编译", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_BUILD, nullptr, nullptr);
+		// 调试安装：存档（settings.cfg/截图/背景）留在游戏目录的 save\，不碰系统 AppData
+		g_hDebugSave = CreateWindowW(L"BUTTON", L"调试安装（存档存游戏目录 save\\）", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_DEBUGSAVE, nullptr, nullptr);
 		// 多线程下载（NDM 式）：勾选后用 HTTP Range 分段多连接拉取大文件（FFmpeg 等）
 		g_hMt = CreateWindowW(L"BUTTON", L"多线程下载", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_MT, nullptr, nullptr);
 		g_hMtCount = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | WS_VSCROLL | CBS_AUTOHSCROLL, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_MTCOUNT, nullptr, nullptr);
@@ -638,7 +643,7 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		g_hStatus = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_STATUS, nullptr, nullptr);
 
 		for(HWND Ctl : {g_hSource, g_hRefresh, g_hVersions, g_hModules, g_hMirror, g_hMirrorHost, g_hProxy, g_hProxyAddr, g_hBuild, g_hMt, g_hMtCount,
-			     g_hInstall, g_hCancel, g_hUpdate, g_hOpenDir, g_hClean, g_hRefMods, g_hLog, g_hStatus, g_hLabel1, g_hLabel2, g_hLabel3, g_hProgText})
+			     g_hInstall, g_hCancel, g_hUpdate, g_hOpenDir, g_hClean, g_hRefMods, g_hDebugSave, g_hLog, g_hStatus, g_hLabel1, g_hLabel2, g_hLabel3, g_hProgText})
 			SendMessageW(Ctl, WM_SETFONT, (WPARAM)Font, TRUE);
 
 		CheckDlgButton(H, IDC_MIRROR, BST_CHECKED);
@@ -667,9 +672,9 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		// 内置来源：即使没有任何清单文件，DDNet / TClient 也必须永远可选
 		if(g_Index.Sources.empty())
 		{
-			g_Index.Sources.push_back({"tclient", "TClient", "TaterClient/TClient"});
 			g_Index.Sources.push_back({"ddnet", "DDNet 官方", "ddnet/ddnet"});
-			AppendLog("[i] 使用内置来源：TClient / DDNet 官方");
+			g_Index.Sources.push_back({"tclient", "TClient", "TaterClient/TClient"});
+			AppendLog("[i] 使用内置来源：DDNet 官方 / TClient");
 		}
 		}
 		else
@@ -746,6 +751,10 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 	}
 	case WM_APP_DONE: {
 		SetBusy(false);
+		// 关键：编译这类"未知百分比"的步骤会把进度条设成跑马灯（PBM_SETMARQUEE TRUE），
+		// 任务结束后必须显式停掉，否则它会一直转，看起来像"还卡在编译"。
+		SendMessageW(g_hProgress, PBM_SETMARQUEE, FALSE, 0);
+		SendMessageW(g_hProgress, PBM_SETPOS, 100, 0);
 		if(W == 1)
 			FillVersions();
 		SetStatus("就绪");

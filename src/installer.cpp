@@ -254,10 +254,15 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 	const std::string Tree = JoinPath(WorkDir0, "src-" + Opt.Source.Id + "-" + Opt.Version.Ref);
 	const std::string ThirdPartyDll = JoinPath(Tree, "thirdparty-dll");
 
-	// 取消时：把「本次」产生的东西全部清掉（下载的源码/子模块、FFmpeg 包与解包目录、
-	// 模块补丁临时文件），让取消之后回到干净状态——下一次安装会重新下载。
+	// 取消时：只清「没下完 / 没做完」的半成品，**已经完成的东西一律保留**——
+	// 用户规则："取消删除是删除未下载完的错误文件，下载完成的文件点取消不用删，下次下载时先检验文件夹中有没有再下"。
+	// 落地：①源码树只在「不是完整 git 仓库」时删（完整树下次直接跳过克隆）；
+	//       ②FFmpeg 包只在「解压验证不通过」时删（完整包下次跳过下载）；
+	//       ③解压目录只在「没有可用的 lib64/include」时删（完整解压下次跳过解压）；
+	//       ④补丁临时文件是本次产物，照删。
 	auto CleanupPartial = [&]() {
 		std::vector<std::string> Killed;
+		std::vector<std::string> Kept;
 		std::vector<std::string> Failed;
 		auto Kill = [&](const std::string &P) {
 			if(P.empty() || !PathExists(P))
@@ -267,9 +272,55 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			else
 				Failed.push_back(P);
 		};
-		Kill(Tree);
-		Kill(JoinPath(WorkDir0, "ffmpeg-8.1.zip"));
-		Kill(JoinPath(WorkDir0, "ffmpeg-extract"));
+		// ① 源码树：完整的留下（下次跳过克隆），半截的删掉
+		if(PathExists(Tree))
+		{
+			if(TreeUsable(Tree))
+				Kept.push_back(Tree);
+			else
+				Kill(Tree);
+		}
+		// ② FFmpeg 包：能正常解压就留下（下次直接跳过下载），否则删掉重下
+		std::string Zip = JoinPath(WorkDir0, "ffmpeg-8.1.zip");
+		if(PathExists(Zip))
+		{
+			std::string Fx = JoinPath(WorkDir0, "_ffcheck");
+			RemoveTree(Fx);
+			MakeDirs(Fx);
+			bool Ok = Do("tar", {"-xf", Zip, "-C", Fx}, "").Ok();
+			RemoveTree(Fx);
+			if(Ok)
+				Kept.push_back(Zip);
+			else
+				Kill(Zip);
+		}
+		// ③ 解压目录：里面已经有可用的库就留下（下次跳过解压）
+		std::string Ex = JoinPath(WorkDir0, "ffmpeg-extract");
+		if(PathExists(Ex))
+		{
+			bool Ready = false;
+			{
+				WIN32_FIND_DATAW Fd;
+				HANDLE H = FindFirstFileW(Utf8ToWide(JoinPath(Ex, "ffmpeg-*")).c_str(), &Fd);
+				if(H != INVALID_HANDLE_VALUE)
+				{
+					do {
+						std::string N = WideToUtf8(Fd.cFileName);
+						if(N != "." && N != "..")
+						{
+							Ready = true;
+							break;
+						}
+					} while(FindNextFileW(H, &Fd));
+					FindClose(H);
+				}
+			}
+			if(Ready)
+				Kept.push_back(Ex);
+			else
+				Kill(Ex);
+		}
+		// ④ 补丁临时文件是本次产物，照删
 		for(const auto &M : Opt.Modules)
 			Kill(JoinPath(WorkDir0, M.Id + ".patch"));
 		// 若 _work 已空就一起收掉，别留空目录
@@ -297,10 +348,12 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		}
 		if(Log)
 		{
-			Log(LogLevel::Info, "  已取消：自动清理本次下载与构建产物");
+			Log(LogLevel::Info, "  已取消：只清理没下完的半成品，已完成的下载保留（下次安装会自动检验并复用）");
 			for(const auto &K : Killed)
-				Log(LogLevel::Info, "    已删除 " + K);
-			if(Killed.empty())
+				Log(LogLevel::Info, "    已删除（半成品）" + K);
+			for(const auto &P : Kept)
+				Log(LogLevel::Info, "    已保留（完整，下次跳过）" + P);
+			if(Killed.empty() && Kept.empty())
 				Log(LogLevel::Info, "    （本次没有产生可清理的文件）");
 			for(const auto &P : Failed)
 				Log(LogLevel::Warn, "    清理失败（可能被占用，可稍后手动删除）：" + P);
@@ -442,6 +495,50 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 				return false;
 			}
 			std::string PatchPath = M.PatchPath;   // .dmod 已解开时是绝对路径
+			// 复用源码树时的重复打补丁保护：上次已经给这棵树打过同一个模块（源码树里留了标记文件），
+			// 这次就直接跳过——否则补丁会叠加，出现"函数已有主体"这类重复定义错误。
+			// 标记里带模块版本：版本变了就先反向卸掉旧补丁，再打新的。
+			bool SkipPatch = false;
+			{
+				std::string MarkPath = JoinPath(Tree, ".dmod-applied-" + M.Id + ".txt");
+				bool MarkOk = false;
+				std::string Mark = PathExists(MarkPath) ? ReadFileText(MarkPath, MarkOk) : "";
+				while(!Mark.empty() && (Mark.back() == '\n' || Mark.back() == '\r'))
+					Mark.pop_back();
+				if(!Mark.empty())
+				{
+					if(Mark == M.Version)
+					{
+						SkipPatch = true;
+						LogAt(LogLevel::Info, "  该模块 v" + M.Version + " 上次已经打在这棵源码树里（复用源码树，跳过打补丁）");
+						if(!M.VerifyPath.empty() && !PathExists(JoinPath(Tree, M.VerifyPath)))
+						{
+							LogAt(LogLevel::Warn, "  但校验文件 " + M.VerifyPath + " 不在，说明上次没打全——删掉标记重新打一次");
+							DeleteFileW(Utf8ToWide(MarkPath).c_str());
+							SkipPatch = false;
+						}
+					}
+					else
+					{
+						LogAt(LogLevel::Info, "  源码树里是 " + M.Id + " v" + Mark + "，本次装 v" + M.Version + "——先撤销旧补丁");
+						// 旧补丁优先用该来源的专用补丁撤销，撤不掉就整棵树重来（下次会重新克隆）
+						std::string OldPatch = M.Patches.count(Opt.Source.Id) ? M.Patches.at(Opt.Source.Id) : M.PatchPath;
+						if(!OldPatch.empty() && PathExists(OldPatch))
+							Do(Opt.GitPath, {"apply", "-R", "--whitespace=nowarn", OldPatch}, Tree);
+						DeleteFileW(Utf8ToWide(MarkPath).c_str());
+					}
+				}
+			}
+			if(!SkipPatch)
+			{
+			// 多基线补丁：按本次来源 id 选专用补丁（模块可为 DDNet/TClient 各带一份）。
+			if(M.Patches.count(Opt.Source.Id))
+			{
+				PatchPath = M.Patches.at(Opt.Source.Id);
+				LogAt(LogLevel::Info, "  使用 " + Opt.Source.Id + " 专用补丁（模块为多个上游基线各带了一份）");
+			}
+			else if(!M.Patches.empty())
+				LogAt(LogLevel::Warn, "  模块没有为 " + Opt.Source.Id + " 带专用补丁——回退通用补丁，可能套不上");
 			if(PatchPath.empty() && !M.PatchLocal.empty())
 			{
 				std::string Local = JoinPath(AppDir, M.PatchLocal);
@@ -474,10 +571,51 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			ProcessResult A = Do(Opt.GitPath, {"apply", "--3way", "--whitespace=nowarn", PatchPath}, Tree);
 			if(!A.Ok())
 			{
-				LogAt(LogLevel::Warn, "  3-way 套用失败，改用 --reject 半自动（能套的套上，其余留 .rej）");
+				// 浅克隆/镜像下 --3way 常因 blob 索引不匹配而整体失败，但 --reject 往往能全部套上，
+				// 所以判断"到底有没有没套上的"必须看实际留下的 .rej 文件数，而不是看退出码。
+				LogAt(LogLevel::Info, "  3-way 套用不适用（镜像/浅克隆的 blob 索引对不上），改用逐 hunk 直接套用");
 				ProcessResult A2 = Do(Opt.GitPath, {"apply", "--reject", "--whitespace=nowarn", PatchPath}, Tree);
-				if(!A2.Ok() && !A2.Output.empty())
-					LogAt(LogLevel::Warn, "  仍有未套用的 hunk，请按模块文档的锚点表手工处理 .rej 文件");
+				int RejCount = 0;
+				std::string FirstRej;
+				{
+					WIN32_FIND_DATAW Fd;
+					std::string Pattern = JoinPath(Tree, "*.rej");
+					HANDLE H = FindFirstFileW(Utf8ToWide(Pattern).c_str(), &Fd);
+					if(H != INVALID_HANDLE_VALUE) { FindClose(H); }
+					// 递归找 .rej（git apply --reject 就地生成，深度不定）
+					std::vector<std::string> Dirs{Tree};
+					while(!Dirs.empty())
+					{
+						std::string D = Dirs.back();
+						Dirs.pop_back();
+						WIN32_FIND_DATAW F2;
+						HANDLE H2 = FindFirstFileW(Utf8ToWide(JoinPath(D, "*")).c_str(), &F2);
+						if(H2 == INVALID_HANDLE_VALUE)
+							continue;
+						do {
+							std::string N = WideToUtf8(F2.cFileName);
+							if(N == "." || N == "..")
+								continue;
+							if(F2.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+							{
+								if(N != ".git")
+									Dirs.push_back(JoinPath(D, N));
+							}
+							else if(N.size() > 4 && N.compare(N.size() - 4, 4, ".rej") == 0)
+							{
+								RejCount++;
+								if(FirstRej.empty())
+									FirstRej = JoinPath(D, N);
+							}
+						} while(FindNextFileW(H2, &F2));
+						FindClose(H2);
+					}
+				}
+				if(RejCount == 0)
+					LogAt(LogLevel::Info, "  补丁已全部套用（逐 hunk 成功，无 .rej 残留）");
+				else
+					LogAt(LogLevel::Warn, "  有 " + std::to_string(RejCount) + " 个 hunk 没套上（首个：" + FirstRej + "），"
+						"请按模块文档的锚点表手工处理 .rej 文件");
 				if(!A2.Ok() && PathExists(JoinPath(Tree, "CMakeLists.txt")) == false)
 				{
 					Error = "补丁套用失败且源码树异常";
@@ -490,7 +628,12 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 				Error = "模块 " + M.Id + " 校验失败：补丁没落地（源码目录不完整，或模块与这个游戏版本的基线不匹配）";
 				return false;
 			}
-			LogAt(LogLevel::Info, "  模块已应用并校验通过");
+			// 打好了就在源码树里留标记（含模块版本）：下次复用这棵树时不会再重复打一遍
+			if(!WriteFileText(JoinPath(Tree, ".dmod-applied-" + M.Id + ".txt"), M.Version + "\n"))
+				LogAt(LogLevel::Warn, "  未能写入已打补丁标记（不影响本次安装，但下次复用源码树可能重复打补丁）");
+			if(!SkipPatch)
+				LogAt(LogLevel::Info, "  模块已应用并校验通过");
+			}   // if(!SkipPatch)
 		}
 		else if(M.Type == "file-drop")
 		{
@@ -504,9 +647,23 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 
 	// ------------------------------------------------------- 5. FFmpeg -----
 	bool FfmpegInstalled = false;
+	bool FfmpegFresh = false;   // 本次真的下载+解压+拷贝过（只有这种情况才 touch 头文件）
 	if(Opt.InstallFfmpeg)
 	{
 		Step(StepNo++, "安装 FFmpeg 8.1（视频背景必需）");
+		// 用户要求：先检测这棵源码树里是否已经装过 FFmpeg（上次安装留下的 lib64+include），
+		// 在就整步跳过——不下载、不解压、不重拷、不 touch（文件没动过就没有 ABI 问题，
+		// touch 反而会引发无谓的大规模重编）。
+		{
+			const std::string Libs = JoinPath(Tree, "ddnet-libs\\ffmpeg");
+			if(PathExists(JoinPath(Libs, "windows\\lib64\\avcodec-62.dll")) &&
+			   PathExists(JoinPath(Libs, "windows\\lib64\\avformat-62.dll")) &&
+			   PathExists(JoinPath(Libs, "include\\libavcodec")))
+			{
+				FfmpegInstalled = true;
+				LogAt(LogLevel::Info, "  FFmpeg 8.1 已在这棵源码树里（上次安装装过）——整步跳过（不下载/不解压/不重拷）");
+			}
+		}
 		std::string Zip = Opt.FfmpegZip;
 		if(Zip.empty())
 			Zip = JoinPath(WorkDir0, "ffmpeg-8.1.zip");
@@ -537,7 +694,10 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 					LastBytes = Got;
 					LastT = Now;
 					char Buf[512];
-					const std::string Th = Opt.DownloadThreads > 1 ? ("，" + std::to_string(Opt.DownloadThreads) + " 线程") : "";
+					int ThN = g_DlThreadsHint.load();   // 与 Download() 实际用的热值保持一致
+					if(ThN < 1)
+						ThN = Opt.DownloadThreads;
+					const std::string Th = ThN > 1 ? ("，" + std::to_string(ThN) + " 线程") : "";
 					if(Total > 0)
 						snprintf(Buf, sizeof(Buf), "下载 FFmpeg 8.1：%d%%（%.2f MB/s，已 %.1f/%.1f MB%s）%s",
 							(int)(Got * 100 / Total), Speed, Got / 1048576.0, Total / 1048576.0, Th.c_str(), ShowUrl.c_str());
@@ -563,6 +723,7 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			if(T.Ok())
 			{
 				FfmpegInstalled = true;
+				FfmpegFresh = true;
 				break;
 			}
 			LogAt(LogLevel::Warn, Attempt == 0
@@ -570,7 +731,7 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 				: "  重新下载后仍解压失败，放弃 FFmpeg（不影响图片背景，视频会不可用）");
 			DeleteFileW(Utf8ToWide(Zip).c_str());
 		}
-		if(FfmpegInstalled)
+		if(FfmpegInstalled && FfmpegFresh)
 		{
 			// bsdtar 解压后通常有一层目录
 			std::string Root = Ex;
@@ -663,8 +824,12 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 				c = '-';
 		return S;
 	};
+	// 调试安装的成品目录名末尾加 -debug，一眼能看出这份是"存档在游戏目录"的版本
+	std::string DistName = SanitizeRef(Opt.Source.Id + "-" + Opt.Version.Ref);
+	if(Opt.DebugSaveInGameDir)
+		DistName += "-debug";
 	std::string Dist = ClientDir0.empty() ? JoinPath(WorkDir0, "Client")
-					  : JoinPath(ClientDir0, SanitizeRef(Opt.Source.Id + "-" + Opt.Version.Ref));
+					  : JoinPath(ClientDir0, DistName);
 	bool Built = false;
 	if(Opt.Build)
 	{
@@ -787,6 +952,52 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		CopyTree(JoinPath(Tree, "data"), JoinPath(Dist, "data"), Error);
 		if(PathExists(JoinPath(Tree, "storage.cfg")))
 			CopyTree(JoinPath(Tree, "storage.cfg"), JoinPath(Dist, "storage.cfg"), Error);
+		// 调试安装：把存档位置从 $USERDIR（系统 AppData\DDNet）改到游戏目录下的 save\，
+		// 所有配置/截图/背景文件都跟着游戏目录走，方便带着走、方便清理、方便对比。
+		// storage.cfg 的**第一条 add_path 决定存档位置**，所以只改第一条即可。
+		if(Opt.DebugSaveInGameDir)
+		{
+			std::string ScPath = JoinPath(Dist, "storage.cfg");
+			bool Ok = false;
+			std::string Sc = PathExists(ScPath) ? ReadFileText(ScPath, Ok) : std::string();
+			if(Sc.empty())
+			{
+				// 源码树里没有 storage.cfg（罕见）：自己造一份最小可用的
+				Sc = "add_path $USERDIR\nadd_path $DATADIR\nadd_path $CURRENTDIR\n";
+			}
+			// 逐行找第一行未被注释的 add_path，替换成 add_path save
+			size_t Pos = 0;
+			bool Replaced = false;
+			std::string Out;
+			while(Pos <= Sc.size())
+			{
+				size_t Eol = Sc.find('\n', Pos);
+				std::string Line = Sc.substr(Pos, Eol == std::string::npos ? std::string::npos : Eol - Pos);
+				std::string Trimmed = Line;
+				while(!Trimmed.empty() && (Trimmed.front() == ' ' || Trimmed.front() == '\t' || Trimmed.front() == '\r'))
+					Trimmed.erase(Trimmed.begin());
+				if(!Replaced && Trimmed.rfind("add_path", 0) == 0)
+				{
+					Out += "add_path save";
+					Replaced = true;
+				}
+				else
+					Out += Line;
+				if(Eol == std::string::npos)
+					break;
+				Out += "\n";
+				Pos = Eol + 1;
+			}
+			if(!Replaced)
+				Out = "add_path save\n" + Out;
+			if(WriteFileText(ScPath, Out))
+			{
+				MakeDirs(JoinPath(Dist, "save"));
+				LogAt(LogLevel::Info, "  调试安装：存档目录已改到游戏目录下的 save\\（storage.cfg 第一条 = add_path save）");
+			}
+			else
+				LogAt(LogLevel::Warn, "  调试安装：storage.cfg 写入失败，存档仍在系统 AppData");
+		}
 		// 完整性校验（强校验，不过就不许报"完成"）：解析 DDNet.exe 的 PE 导入表，
 		// 每个非系统 DLL 依赖都必须在 client\ 里——缺了就报安装中断并点名缺谁。
 		{
