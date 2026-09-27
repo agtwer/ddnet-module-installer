@@ -12,8 +12,8 @@ C++ / Win32 单文件程序。
 | **选择安装哪个版本** | 列表里点选 |
 | **模块选择安装** | **单文件 mod（`.dmod`）驱动**，可多选、可拖入 |
 | **一键装完可用** | 拉源码 → 子模块 → 套模块补丁（3-way，失败自动 `--reject` 并留 `.rej`）→ 装 FFmpeg 8.1（模块声明 `requires` 时才装，视频背景必需）→ CMake 配置 → 编译 → 组装出 `client\<种类>-<版本>\`（双击即玩） |
-| **更新能力** | 记录 `install-state.json`（来源/版本/模块/目录/时间）；`检查更新` 会比对最新版本并给出「已是最新 / 可更新 X → Y」 |
-| **日志可追溯** | 界面实时日志 + 落地 `installer.log`（便于自动化核对与排错） |
+| **更新能力** | 记录 `debug\install-state.json`（来源/版本/模块/目录/时间）；`检查更新` 会比对最新版本并给出「已是最新 / 可更新 X → Y」 |
+| **日志可追溯** | 界面实时日志 + 落地 `debug\installer.log`（便于自动化核对与排错） |
 | **进度与速度** | 进度条走**整体进度**（2% 准备 → 5~15% 下载源码 → 18~30% 子模块 → 30~55% 模块 → 60~78% FFmpeg → 82% 配置 → 85~94% 编译 → 100%）。下面那行状态实时显示**当前下载的百分比 + 速度**，例如 `下载源码：15% · 340.00 KiB/s · 整体 6%`（源码、子模块、FFmpeg 三个阶段都有；下载地址显示在每一步的开头行）。**编译阶段没有可靠的百分比**，所以进度条切成滚动动画，状态行显示 `已编译 N 个文件 · 已用 m:ss` |
 
 ## 构建
@@ -81,7 +81,7 @@ A **DDNet source fetch-and-build tool**: it pulls a chosen upstream source tree,
 - **Version list** from GitHub `releases` (falls back to `tags`). Mirrors and a local proxy are optional; most mirrors do not proxy `api.github.com`, so the version API retries directly and says so in the log.
 - **Module driven**: modules are single-file `.dmod` packages (multi-select, drag-and-drop). Adding a module never requires rebuilding this program.
 - **One click, ready to play**: fetch source → submodules → apply module patch → install FFmpeg 8.1 when a module requires it → CMake configure → build → assemble `client\<kind>-<version>\` (double-click to run).
-- **Update check** via `install-state.json`; live log plus a persisted `installer.log`.
+- **Update check** via `debug/install-state.json`; live log plus a persisted `debug/installer.log`.
 
 ## Usage
 

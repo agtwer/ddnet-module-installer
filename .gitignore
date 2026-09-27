@@ -1,3 +1,4 @@
 build/
+debug/
 installer.log
 install-state.json

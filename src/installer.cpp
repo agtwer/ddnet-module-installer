@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <sstream>
 
@@ -118,6 +119,10 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		int Base = 0, Span = 0;          // 映射到 [Base, Base+Span]
 		std::string What;                // "下载源码" / "初始化子模块"
 		std::chrono::steady_clock::time_point LastUi = std::chrono::steady_clock::now();
+		// 子模块（浅克隆）有的阶段只打速度、不打百分比，"数字%"匹配不上 → 进度会一直卡在 0%。
+		// 这里额外记"已下载字节数"，用一条温和的渐近曲线把它换算成百分比。
+		double BytesDone = 0.0;          // 最近一次看到的累计已传字节（MiB）
+		int BytesPct = 0;                // 由字节数推出的百分比（只增不减）
 		bool Active() const { return Span > 0; }
 	} Gp;
 	int Compiled = 0;
@@ -127,49 +132,93 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 	HandleProcLine = [&](const std::string &Line) -> bool {
 		if(Gp.Active())
 		{
-			const size_t PctPos = Line.find('%');
-			if(PctPos != std::string::npos && PctPos > 0 && isdigit((unsigned char)Line[PctPos - 1]))
+			// 先解析速度（形如 "... | 430.00 KiB/s"），有无百分比都可能出现
+			std::string Speed;
+			const size_t Bar = Line.find('|');
+			if(Bar != std::string::npos)
 			{
-				int P = 0;
+				const size_t S = Line.find_first_not_of(" \t", Bar + 1);
+				if(S != std::string::npos)
 				{
-					size_t A = PctPos;
-					while(A > 0 && isdigit((unsigned char)Line[A - 1]))
-						--A;
-					P = atoi(Line.substr(A, PctPos - A).c_str());
-					if(P < 0)
-						P = 0;
-					if(P > 100)
-						P = 100;
+					const size_t E = Line.find_first_of(",;", S);
+					Speed = Line.substr(S, E == std::string::npos ? std::string::npos : E - S);
+					const size_t A2 = Speed.find_first_not_of(" \t");
+					const size_t E2 = Speed.find_last_not_of(" \t");
+					Speed = (A2 == std::string::npos) ? "" : Speed.substr(A2, E2 - A2 + 1);
 				}
-				std::string Speed;
-				const size_t Bar = Line.find('|');
-				if(Bar != std::string::npos)
-				{
-					const size_t S = Line.find_first_not_of(" \t", Bar + 1);
-					if(S != std::string::npos)
-					{
-						const size_t E = Line.find_first_of(",;", S);
-						Speed = Line.substr(S, E == std::string::npos ? std::string::npos : E - S);
-						// git 会把速度字段补空格对齐，去掉首尾空白
-						const size_t A2 = Speed.find_first_not_of(" \t");
-						const size_t E2 = Speed.find_last_not_of(" \t");
-						Speed = (A2 == std::string::npos) ? "" : Speed.substr(A2, E2 - A2 + 1);
-					}
-				}
-				auto Now = std::chrono::steady_clock::now();
-				if(std::chrono::duration<double>(Now - Gp.LastUi).count() < 0.4)
-					return true;   // 认领这行，但节流到 ~2.5 次/秒再刷新界面
-				Gp.LastUi = Now;
-				const int Overall = Gp.Base + Gp.Span * P / 100;
-				char Buf[256];
-				if(!Speed.empty())
-					snprintf(Buf, sizeof(Buf), "%s：%d%% · %s · 整体 %d%%", Gp.What.c_str(), P, Speed.c_str(), Overall);
-				else
-					snprintf(Buf, sizeof(Buf), "%s：%d%% · 整体 %d%%", Gp.What.c_str(), P, Overall);
-				Report(Overall, Buf);
-				return true;
 			}
-			return false;
+			// 累计已传字节（形如 "12.34 MiB"）：浅克隆子模块阶段常用它、不一定给百分比
+			{
+				static const char *Units[] = {"GiB", "MiB", "KiB", "B"};
+				static const double Mult[] = {1024.0, 1.0, 1.0 / 1024.0, 1.0 / (1024.0 * 1024.0)};
+				for(int U = 0; U < 4; ++U)
+				{
+					const size_t P = Line.find(Units[U]);
+					if(P == std::string::npos)
+						continue;
+					size_t A = P;
+					// 先跳过数字与单位之间的空格（git 打的是 "1.20 MiB"，中间有空格，
+					// 不跳过去就会扫出空串 → 字节数恒为 0）
+					while(A > 0 && (Line[A - 1] == ' ' || Line[A - 1] == '\t'))
+						--A;
+					const size_t NumEnd = A;
+					while(A > 0 && (isdigit((unsigned char)Line[A - 1]) || Line[A - 1] == '.'))
+						--A;
+					if(A < NumEnd)
+					{
+						const double V = atof(Line.substr(A, NumEnd - A).c_str()) * Mult[U];
+						if(V > Gp.BytesDone)
+							Gp.BytesDone = V;
+					}
+					break;
+				}
+			}
+			const size_t PctPos = Line.find('%');
+			bool HavePct = (PctPos != std::string::npos && PctPos > 0 && isdigit((unsigned char)Line[PctPos - 1]));
+			// 这一行是否"带进度信息"：有百分比，或有速度，或本来就已进入字节估算。
+			// 都没有（例如 "remote: Total 2065 ..."）就不认领，让日志原样打出来。
+			const bool HasBytes = (Line.find("MiB") != std::string::npos || Line.find("KiB") != std::string::npos ||
+					       Line.find("GiB") != std::string::npos);
+			int P = -1;
+			if(HavePct)
+			{
+				size_t A = PctPos;
+				while(A > 0 && isdigit((unsigned char)Line[A - 1]))
+					--A;
+				P = atoi(Line.substr(A, PctPos - A).c_str());
+				if(P < 0)
+					P = 0;
+				if(P > 100)
+					P = 100;
+			}
+			else if(Gp.BytesDone > 0.0 && (HasBytes || !Speed.empty()))
+			{
+				// 没有百分比：用已下载字节估算。ddnet-libs 约 580MiB，
+				// 用渐近曲线 100*(1-exp(-bytes/K))，K 取 300MiB —— 越接近完成涨得越慢，
+				// 永远不会虚报 100%，但能明确表示"在持续推进"。
+				const double K = 300.0;
+				int Est = (int)(100.0 * (1.0 - exp(-Gp.BytesDone / K)));
+				if(Est > 96)
+					Est = 96;
+				if(Est > Gp.BytesPct)
+					Gp.BytesPct = Est;
+				P = Gp.BytesPct;
+			}
+			if(P < 0)
+				return false;
+
+			auto Now = std::chrono::steady_clock::now();
+			if(std::chrono::duration<double>(Now - Gp.LastUi).count() < 0.4)
+				return true;   // 认领这行，但节流到 ~2.5 次/秒再刷新界面
+			Gp.LastUi = Now;
+			const int Overall = Gp.Base + Gp.Span * P / 100;
+			char Buf[256];
+			if(!Speed.empty())
+				snprintf(Buf, sizeof(Buf), "%s：%d%% · %s · 整体 %d%%", Gp.What.c_str(), P, Speed.c_str(), Overall);
+			else
+				snprintf(Buf, sizeof(Buf), "%s：%d%% · 整体 %d%%", Gp.What.c_str(), P, Overall);
+			Report(Overall, Buf);
+			return true;
 		}
 		if(InCompile)
 		{
@@ -386,6 +435,8 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		Gp.Span = 10;
 		Gp.What = "下载源码";
 		Gp.LastUi = std::chrono::steady_clock::now();
+		Gp.BytesDone = 0.0;
+		Gp.BytesPct = 0;
 		ProcessResult R = Do(Opt.GitPath, WithNet({"clone", "--progress", "--depth", "1", "--branch", Opt.Version.Ref, CloneUrl, Tree}), "");
 		if(!R.Ok() && Cancelled())
 		{
@@ -448,6 +499,8 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		Gp.Span = 12;
 		Gp.What = "下载子模块 ddnet-libs";
 		Gp.LastUi = std::chrono::steady_clock::now();
+		Gp.BytesDone = 0.0;
+		Gp.BytesPct = 0;
 		if(CheckCancel())
 			{
 				CleanupPartial();
@@ -1037,7 +1090,9 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 	OutState.Modules.clear();
 	for(const auto &M : Opt.Modules)
 		OutState.Modules.push_back(M.Id + "@" + (M.Version.empty() ? "?" : M.Version));
-	InstallState::Save(JoinPath(AppDir, "install-state.json"), OutState);
+	// 安装记录与日志同在 debug 子目录，避免程序根目录散落文件
+	MakeDirs(JoinPath(AppDir, "debug"));
+	InstallState::Save(JoinPath(JoinPath(AppDir, "debug"), "install-state.json"), OutState);
 	Step(StepNo++, std::string("完成") + (FfmpegInstalled ? "（含视频支持）" : "（未装 FFmpeg：仅图片）"));
 	Report(100, std::string("完成") + (FfmpegInstalled ? "（含视频支持）" : "（未装 FFmpeg：仅图片）") + " → " + Dist);
 	return true;

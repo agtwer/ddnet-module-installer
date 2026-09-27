@@ -21,6 +21,7 @@ namespace
 	const int IDC_BUILD = 1009, IDC_INSTALL = 1010, IDC_CANCEL = 1011, IDC_OPENDIR = 1012;
 	const int IDC_CLEAN = 1023, IDC_REFMODS = 1024;   // 一键清理 src\ / 刷新 mods\ 模块列表
 	const int IDC_DEBUGSAVE = 1025;                   // 调试安装：存档放游戏目录的 save 文件夹
+	const int IDC_RELOADLOG = 1026;                   // 刷新日志：重新读 installer.log 铺到日志区
 	const int IDC_PROGRESS = 1013, IDC_LOG = 1014, IDC_STATUS = 1015, IDC_UPDATE = 1016;
 	const int IDC_SRCLIST = 1017;
 	const int IDC_MIRRORHOST = 1018, IDC_PROXY = 1019, IDC_PROXYADDR = 1020;
@@ -48,7 +49,7 @@ namespace
 	HWND g_hMirrorHost, g_hProxy, g_hProxyAddr;
 	HWND g_hMt, g_hMtCount;   // 多线程下载
 	HWND g_hBuild, g_hInstall, g_hCancel, g_hOpenDir, g_hProgress, g_hLog, g_hStatus, g_hUpdate;
-	HWND g_hClean, g_hRefMods, g_hDebugSave;
+	HWND g_hClean, g_hRefMods, g_hDebugSave, g_hReloadLog;
 	HWND g_hLabel1, g_hLabel2, g_hLabel3;
 
 	const wchar_t *CHECK = L"\u2714";   // ✔
@@ -69,10 +70,49 @@ namespace
 				fclose(F);
 			}
 		}
+		// 日志区只保留最近若干行：安装过程中 git 进度/编译文件名会刷上万行，
+		// 控件内容无限增长会让每次追加都变慢（整段重排），表现出来就是"界面卡住"。
+		// 超过上限就砍掉开头的一段（EM_SETSEL + WM_CLEAR 一次清掉前 1/4）。
+		static const int kMaxLogChars = 120000;
+		static const int kTrimToChars = 90000;
+		if(GetWindowTextLengthW(g_hLog) > kMaxLogChars)
+		{
+			SendMessageW(g_hLog, EM_SETSEL, 0, kTrimToChars);
+			SendMessageW(g_hLog, WM_CLEAR, 0, 0);
+			SendMessageW(g_hLog, EM_SETSEL, -1, -1);
+			SendMessageW(g_hLog, EM_REPLACESEL, FALSE, (LPARAM)L"[… 已省略较早的日志（完整内容见 debug\\installer.log）]\r\n");
+		}
 		int Len = GetWindowTextLengthW(g_hLog);
 		SendMessageW(g_hLog, EM_SETSEL, Len, Len);
 		std::string S = Line + "\r\n";
 		SendMessageW(g_hLog, EM_REPLACESEL, FALSE, (LPARAM)Utf8ToWide(S).c_str());
+		if(g_hLog && IsWindowVisible(g_hLog))
+			SendMessageW(g_hLog, EM_SCROLLCARET, 0, 0);
+	}
+
+	// 刷新日志：把 installer.log 的尾部重新铺到日志区（界面卡住/滚动错乱时用）
+	void ReloadLogFromFile()
+	{
+		bool Ok = false;
+		std::string Text = g_LogFile.empty() ? std::string() : ReadFileText(g_LogFile, Ok);
+		if(!Ok || Text.empty())
+		{
+			AppendLog("[i] 没有可显示的日志文件（debug\\installer.log 为空或不存在）");
+			return;
+		}
+		// 只取尾部，避免把巨大日志整段塞进控件
+		const size_t Limit = 60000;
+		if(Text.size() > Limit)
+		{
+			size_t Cut = Text.size() - Limit;
+			const size_t Nl = Text.find('\n', Cut);
+			if(Nl != std::string::npos)
+				Cut = Nl + 1;
+			Text = "[… 只显示日志末尾部分，完整内容见 debug\\installer.log]\r\n" + Text.substr(Cut);
+		}
+		SetWindowTextW(g_hLog, Utf8ToWide(Text).c_str());
+		SendMessageW(g_hLog, EM_SETSEL, -1, -1);
+		SendMessageW(g_hLog, EM_SCROLLCARET, 0, 0);
 	}
 
 	void LogBridge(LogLevel Lv, const std::string &S)
@@ -105,6 +145,7 @@ namespace
 		EnableWindow(g_hUpdate, !Busy);
 		EnableWindow(g_hClean, !Busy);     // 安装进行中不能删 src\（正在用）
 		EnableWindow(g_hRefMods, !Busy);
+		EnableWindow(g_hReloadLog, !Busy);   // 刷新日志也走 worker，安装中避免并发重入
 		EnableWindow(g_hCancel, Busy);
 		SendMessageW(g_hProgress, PBM_SETMARQUEE, FALSE, 0);   // 每轮都从"确定式"开始
 		if(Busy)
@@ -124,7 +165,8 @@ namespace
 	{
 		std::string ModsDir = JoinPath(ExeDir(), "mods");
 		MakeDirs(ModsDir);
-		std::string CacheDir = JoinPath(ExeDir(), "_mods");
+		// 解包缓存放在 src 目录下（与源码/构建等"派生数据"同处），不再在程序根目录留下去
+		std::string CacheDir = JoinPath(JoinPath(ExeDir(), "src"), "_mods");
 		int LoadedMods = 0;
 		WIN32_FIND_DATAW Fd;
 		HANDLE Hf = FindFirstFileW(Utf8ToWide(JoinPath(ModsDir, "*.dmod")).c_str(), &Fd);
@@ -179,6 +221,34 @@ namespace
 		return Total;
 	}
 
+	// 把目录移到回收站（可恢复），失败返回 false。
+	// 用 SHFileOperationW + FOF_ALLOWUNDO：这是"删除到回收站"的标准做法。
+	bool MoveToRecycleBin(const std::string &Dir, std::string &Err)
+	{
+		std::wstring W = Utf8ToWide(Dir);
+		// SHFileOperationW 要求双 null 结尾
+		W.push_back(L'\0');
+		W.push_back(L'\0');
+		SHFILEOPSTRUCTW Op = {};
+		Op.wFunc = FO_DELETE;
+		Op.pFrom = W.c_str();
+		Op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+		const int R = SHFileOperationW(&Op);
+		if(R != 0)
+		{
+			char Buf[64];
+			snprintf(Buf, sizeof(Buf), "SHFileOperation 返回 %d", R);
+			Err = Buf;
+			return false;
+		}
+		if(Op.fAnyOperationsAborted)
+		{
+			Err = "操作被中止";
+			return false;
+		}
+		return !PathExists(Dir);
+	}
+
 	void WorkerCleanSrc()
 	{
 		SetBusy(true);
@@ -189,16 +259,17 @@ namespace
 			PostMessageW(g_hMain, WM_APP_DONE, 3, 0);
 			return;
 		}
-		LogBridge(LogLevel::Info, "正在清理源码与构建产物（文件很多，可能要几秒到几十秒）…");
+		LogBridge(LogLevel::Info, "正在清理源码与构建产物（移到回收站，可恢复；文件很多，可能要几秒到几十秒）…");
 		uint64_t Bytes = DirSizeBytes(SrcDir);
 		char Buf[64];
 		snprintf(Buf, sizeof(Buf), "%.2f GB", Bytes / 1073741824.0);
-		bool Ok = RemoveTree(SrcDir);
+		std::string RErr;
+		bool Ok = MoveToRecycleBin(SrcDir, RErr);
 		MakeDirs(SrcDir);   // 目录保留（固定布局：src\ 由安装流程继续使用）
 		if(Ok)
-			LogBridge(LogLevel::Info, std::string("已清理 src\\（源码 + 构建，释放约 ") + Buf + "）；下次安装会重新克隆");
+			LogBridge(LogLevel::Info, std::string("已把 src\\ 移到回收站（释放约 ") + Buf + "，可从回收站恢复）；下次安装会重新克隆");
 		else
-			LogBridge(LogLevel::Error, "清理 src\\ 没删干净（可能有文件被占用，可关闭占用程序后再点一次）");
+			LogBridge(LogLevel::Error, "移入回收站失败（" + RErr + "）；可能有文件被占用，可关闭占用程序后再点一次");
 		PostMessageW(g_hMain, WM_APP_DONE, 3, 0);
 	}
 
@@ -427,7 +498,7 @@ namespace
 		SetBusy(true);
 		ApplyNetSettings();
 		if(!g_HasState)
-			LogBridge(LogLevel::Warn, "本机还没有安装记录（install-state.json），先安装一次再看更新");
+			LogBridge(LogLevel::Warn, "本机还没有安装记录（debug\\install-state.json），先安装一次再看更新");
 		else
 		{
 			LogBridge(LogLevel::Step, "检查更新：本机已装 " + g_State.SourceId + " @" + g_State.Version + "（" + NetSummary() + "）");
@@ -564,8 +635,9 @@ namespace
 		MoveWindow(g_hOpenDir, LeftX + 304, Y3, 110, 28, TRUE);
 		MoveWindow(g_hClean, LeftX + 422, Y3, 92, 28, TRUE);
 		MoveWindow(g_hRefMods, LeftX + 522, Y3, 92, 28, TRUE);
-		MoveWindow(g_hProgress, LeftX + 622, Y3 + 2, W - M * 2 - 622, 18, TRUE);
-		MoveWindow(g_hProgText, LeftX + 622, Y3 + 22, W - M * 2 - 622, 16, TRUE);
+		MoveWindow(g_hReloadLog, LeftX + 622, Y3, 92, 28, TRUE);
+		MoveWindow(g_hProgress, LeftX + 722, Y3 + 2, W - M * 2 - 722, 18, TRUE);
+		MoveWindow(g_hProgText, LeftX + 722, Y3 + 22, W - M * 2 - 722, 16, TRUE);
 
 		int Y4 = Y3 + 44;
 		int LogH = Hh - Y4 - 52;
@@ -637,13 +709,14 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		g_hOpenDir = CreateWindowW(L"BUTTON", L"打开安装目录", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_OPENDIR, nullptr, nullptr);
 		g_hClean = CreateWindowW(L"BUTTON", L"清理源码", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_CLEAN, nullptr, nullptr);
 		g_hRefMods = CreateWindowW(L"BUTTON", L"刷新模块", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_REFMODS, nullptr, nullptr);
+		g_hReloadLog = CreateWindowW(L"BUTTON", L"刷新日志", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_RELOADLOG, nullptr, nullptr);
 		g_hProgress = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE | PBS_MARQUEE, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_PROGRESS, nullptr, nullptr);
 		g_hProgText = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS, 0, 0, 0, 0, H, nullptr, nullptr, nullptr);
 		g_hLog = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_LOG, nullptr, nullptr);
 		g_hStatus = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_STATUS, nullptr, nullptr);
 
 		for(HWND Ctl : {g_hSource, g_hRefresh, g_hVersions, g_hModules, g_hMirror, g_hMirrorHost, g_hProxy, g_hProxyAddr, g_hBuild, g_hMt, g_hMtCount,
-			     g_hInstall, g_hCancel, g_hUpdate, g_hOpenDir, g_hClean, g_hRefMods, g_hDebugSave, g_hLog, g_hStatus, g_hLabel1, g_hLabel2, g_hLabel3, g_hProgText})
+			     g_hInstall, g_hCancel, g_hUpdate, g_hOpenDir, g_hClean, g_hRefMods, g_hReloadLog, g_hDebugSave, g_hLog, g_hStatus, g_hLabel1, g_hLabel2, g_hLabel3, g_hProgText})
 			SendMessageW(Ctl, WM_SETFONT, (WPARAM)Font, TRUE);
 
 		CheckDlgButton(H, IDC_MIRROR, BST_CHECKED);
@@ -710,7 +783,7 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		FillModules();
 		StartWorker(WorkerRefresh);
 
-		g_HasState = InstallState::Load(JoinPath(ExeDir(), "install-state.json"), g_State);
+		g_HasState = InstallState::Load(JoinPath(JoinPath(ExeDir(), "debug"), "install-state.json"), g_State);
 		if(g_HasState)
 		{
 			AppendLog("[i] 检测到已安装记录：" + g_State.SourceId + " @" + g_State.Version + "（" + g_State.Timestamp + "）");
@@ -791,6 +864,12 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 			AppendLog("[i] 已请求取消：正在结束当前下载/子进程，本次已下载内容将自动清理");
 			SetStatus("正在取消…");
 		}
+		else if(Id == IDC_RELOADLOG && HIWORD(W) == BN_CLICKED)
+		{
+			// 直接在 UI 线程里重铺日志（要动控件文本，必须在本线程）
+			ReloadLogFromFile();
+			SetStatus("日志已刷新");
+		}
 		else if(Id == IDC_MIRROR && HIWORD(W) == BN_CLICKED)
 		{
 			SyncNetControls(false);
@@ -840,7 +919,7 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		UINT Count = DragQueryFileW(Drop, 0xFFFFFFFF, nullptr, 0);
 		int Added = 0;
 		std::string ModsDir = JoinPath(g_Installer.AppDir, "mods");
-		std::string CacheDir = JoinPath(g_Installer.AppDir, "_mods");
+		std::string CacheDir = JoinPath(JoinPath(g_Installer.AppDir, "src"), "_mods");
 		MakeDirs(ModsDir);
 		for(UINT i = 0; i < Count; ++i)
 		{
@@ -967,7 +1046,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
 	g_Installer.pCancel = &g_CancelFlag;
 	g_Installer.Net.pCancel = &g_CancelFlag;
 	g_Installer.AppDir = ExeDir();
-	g_LogFile = JoinPath(g_Installer.AppDir, "installer.log");
+	// 日志与安装记录统一放在 debug 子目录，程序根目录只留 mods / src / client
+	MakeDirs(JoinPath(g_Installer.AppDir, "debug"));
+	g_LogFile = JoinPath(JoinPath(g_Installer.AppDir, "debug"), "installer.log");
 	{
 		FILE *F = nullptr;
 		if(fopen_s(&F, g_LogFile.c_str(), "wb") == 0 && F)
