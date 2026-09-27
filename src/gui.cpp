@@ -700,7 +700,31 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 	switch(Msg)
 	{
 	case WM_CREATE: {
-		HFONT Font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+		// 字体：强制使用程序自带的「方正喵呜体」（<exe>\方正喵呜体.ttf）。
+		// 用 AddFontResourceExW 以"仅本进程可见"的方式载入（FR_PRIVATE），不污染系统字体目录；
+		// 载入失败才退回系统默认 GUI 字体，并在日志里说明。
+		HFONT Font = nullptr;
+		{
+			const std::wstring FontFile = Utf8ToWide(JoinPath(ExeDir(), "方正喵呜体.ttf"));
+			if(PathExists(JoinPath(ExeDir(), "方正喵呜体.ttf")))
+			{
+				if(AddFontResourceExW(FontFile.c_str(), FR_PRIVATE, 0) > 0)
+				{
+					Font = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+							   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+							   DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"方正喵呜体");
+					if(!Font)
+						Font = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+								   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+								   DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"FZMWJW");
+				}
+			}
+			if(!Font)
+			{
+				Font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+				AppendLog("[!] 未找到或无法载入程序目录的 方正喵呜体.ttf，已退回系统默认字体");
+			}
+		}
 
 		g_hLabel1 = CreateWindowW(L"STATIC", L"游戏来源与版本（点「刷新版本」拉取最新）", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, H, nullptr, nullptr, nullptr);
 		g_hSource = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_SOURCE, nullptr, nullptr);

@@ -304,6 +304,10 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		return false;
 	}
 	const std::string Tree = JoinPath(WorkDir0, "src-" + Opt.Source.Id + "-" + Opt.Version.Ref);
+	// 克隆的落点：先放到 downloading（中转），克隆成功后再移到 src。
+	// 这样"正在 clone"不会污染 src —— 中途取消/崩溃只会留 downloading 里的残缺树。
+	const std::string TreeName = "src-" + Opt.Source.Id + "-" + Opt.Version.Ref;
+	const std::string CloneTo = JoinPath(DownDir0, TreeName);
 	const std::string ThirdPartyDll = JoinPath(Tree, "thirdparty-dll");
 
 	// 取消时：只清「没下完 / 没做完」的半成品，**已经完成的东西一律保留**——
@@ -474,7 +478,7 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		Gp.LastUi = std::chrono::steady_clock::now();
 		Gp.BytesDone = 0.0;
 		Gp.BytesPct = 0;
-		ProcessResult R = Do(Opt.GitPath, WithNet({"clone", "--progress", "--depth", "1", "--branch", Opt.Version.Ref, CloneUrl, Tree}), "");
+		ProcessResult R = Do(Opt.GitPath, WithNet({"clone", "--progress", "--depth", "1", "--branch", Opt.Version.Ref, CloneUrl, CloneTo}), "");
 		if(!R.Ok() && Cancelled())
 		{
 			CleanupPartial();
@@ -486,16 +490,16 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			// 低速保护触发/传输被掐断：同样的设置重试一次，换新连接往往就过了
 			// （代理软件在运行时直连反而更慢，所以先别降级）。
 			LogAt(LogLevel::Warn, "  克隆中断（多半是代理/网络传输被掐断）——原设置重试一次（换新连接）");
-			RemoveTree(Tree);
-			R = Do(Opt.GitPath, WithNet({"clone", "--progress", "--depth", "1", "--branch", Opt.Version.Ref, CloneUrl, Tree}), "");
+			RemoveTree(CloneTo);
+			R = Do(Opt.GitPath, WithNet({"clone", "--progress", "--depth", "1", "--branch", Opt.Version.Ref, CloneUrl, CloneTo}), "");
 		}
 		if(!R.Ok() && GitProxy)
 		{
 			// 多半是代理软件没在运行：关掉代理（镜像仍保留）再试一次，别让整个安装白白失败
 			LogAt(LogLevel::Warn, "  克隆仍失败，而本次勾了代理 " + Opt.Proxy + " —— 关掉代理直连重试一次");
 			GitProxy = false;
-			RemoveTree(Tree);
-			R = Do(Opt.GitPath, WithNet({"clone", "--progress", "--depth", "1", "--branch", Opt.Version.Ref, CloneUrl, Tree}), "");
+			RemoveTree(CloneTo);
+			R = Do(Opt.GitPath, WithNet({"clone", "--progress", "--depth", "1", "--branch", Opt.Version.Ref, CloneUrl, CloneTo}), "");
 		}
 		if(!R.Ok())
 		{
@@ -519,6 +523,22 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		}
 	}
 	Gp.Span = 0;   // 源码阶段结束
+	// 克隆成功：把 downloading 里那棵树移到 src（此时才算"已完成的源码"）
+	if(PathExists(CloneTo))
+	{
+		RemoveTree(Tree);
+		bool Moved = (MoveFileW(Utf8ToWide(CloneTo).c_str(), Utf8ToWide(Tree).c_str()) != 0);
+		if(!Moved)
+		{
+			// 跨卷/被占用时退回复制
+			MakeDirs(Tree);
+			Moved = Do("xcopy", {"/E", "/I", "/Y", "/Q", CloneTo, Tree}, "").Ok();
+			if(Moved)
+				RemoveTree(CloneTo);
+		}
+		if(!Moved)
+			LogAt(LogLevel::Warn, "  源码树从 downloading 移入 src 失败，将直接使用 downloading 里的树");
+	}
 	LogAt(LogLevel::Info, "  源码: " + Tree);
 	Report(15, "源码就绪：" + Tree);
 	if(CheckCancel())
