@@ -365,6 +365,7 @@ namespace
 
 	// 多线程下载热生效（用户要求"能热改线程数"）：勾选状态或输入框一变就写全局提示值，
 	// 安装工作线程每次开始下载一个文件时读它——改完对下一个文件立即生效。
+	// 每次实际变化都写日志（用户要求：切换线程的操作要记录在案）。
 	void UpdateHotThreads()
 	{
 		int T = 1;
@@ -376,7 +377,24 @@ namespace
 			if(T > 16)
 				T = 16;
 		}
+		int Old = g_DlThreadsHint.load();
+		if(T == Old)
+			return;
 		g_DlThreadsHint.store(T);
+		char Buf[160];
+		if(T > 1)
+			snprintf(Buf, sizeof(Buf), "[i] 下载线程数切换：%d → %d（热生效：下一个开始下载的文件用 %d 线程）", Old, T, T);
+		else
+			snprintf(Buf, sizeof(Buf), "[i] 下载线程数切换：%d → 单连接（热生效：下一个开始下载的文件不用多线程）", Old);
+		AppendLog(Buf);
+	}
+
+	// 安装进行中改动镜像/代理：写日志存证（本次运行仍用开始时的快照，下一轮才生效）
+	void LogNetToggleDuringInstall()
+	{
+		if(!g_Busy)
+			return;
+		AppendLog("[i] 安装进行中切换了镜像/代理（已记录在案）——本次运行继续用安装开始时的设置（见上方「开始安装」行），改动对下一轮安装生效");
 	}
 
 	std::string NetSummary()
@@ -765,16 +783,26 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 			SetStatus("正在取消…");
 		}
 		else if(Id == IDC_MIRROR && HIWORD(W) == BN_CLICKED)
+		{
 			SyncNetControls(false);
+			LogNetToggleDuringInstall();
+		}
 		else if(Id == IDC_PROXY && HIWORD(W) == BN_CLICKED)
+		{
 			SyncNetControls(true);
+			LogNetToggleDuringInstall();
+		}
+		else if(Id == IDC_MIRRORHOST && (HIWORD(W) == CBN_EDITCHANGE || HIWORD(W) == CBN_SELCHANGE))
+			LogNetToggleDuringInstall();   // 改镜像地址（如 gh.meali.top ↔ ghproxy.net）
+		else if(Id == IDC_PROXYADDR && HIWORD(W) == EN_CHANGE)
+			LogNetToggleDuringInstall();   // 改代理地址
 		else if(Id == IDC_MT && HIWORD(W) == BN_CLICKED)
 		{
 			EnableWindow(g_hMtCount, SendMessageW(g_hMt, BM_GETCHECK, 0, 0) == BST_CHECKED);
 			UpdateHotThreads();   // 热生效：勾/取消多线程立即影响下一个下载
 		}
-		else if(Id == IDC_MTCOUNT && HIWORD(W) == EN_CHANGE)
-			UpdateHotThreads();   // 热生效：安装进行中改线程数，下一个文件就用新值
+		else if(Id == IDC_MTCOUNT && (HIWORD(W) == CBN_EDITCHANGE || HIWORD(W) == CBN_SELCHANGE))
+			UpdateHotThreads();   // 热生效：安装进行中改线程数（可编辑下拉发 CBN_EDITCHANGE，不是 EN_CHANGE）
 		else if(Id == IDC_BROWSE)
 		{
 			BROWSEINFOW Bi = {};
