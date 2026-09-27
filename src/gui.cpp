@@ -159,14 +159,22 @@ namespace
 		EnableWindow(g_hProgText, TRUE);
 	}
 
+	// ---- 目录布局：一切数据都在 <exe>\.ddnet\ 下，程序根目录只留 exe 本身 ------
+	std::string DataRoot() { return JoinPath(ExeDir(), ".ddnet"); }
+	std::string ModsDirPath() { return JoinPath(DataRoot(), "mods"); }
+	std::string SrcDirPath() { return JoinPath(DataRoot(), "src"); }
+	std::string ClientDirPath() { return JoinPath(DataRoot(), "ddnet-client"); }
+	std::string DownloadingDirPath() { return JoinPath(DataRoot(), "downloading"); }
+	std::string DebugDirPath() { return JoinPath(DataRoot(), "debug"); }
+	std::string ModCacheDirPath() { return JoinPath(SrcDirPath(), "_mods"); }
+
 	// --------------------------------------------------------------- 填充 ----
 	// 扫描 mods\*.dmod 并合并进模块列表（替换同 id 旧版）。启动与「刷新模块」共用。
 	int ScanModsFolder()
 	{
-		std::string ModsDir = JoinPath(ExeDir(), "mods");
+		std::string ModsDir = ModsDirPath();
 		MakeDirs(ModsDir);
-		// 解包缓存放在 src 目录下（与源码/构建等"派生数据"同处），不再在程序根目录留下去
-		std::string CacheDir = JoinPath(JoinPath(ExeDir(), "src"), "_mods");
+		std::string CacheDir = ModCacheDirPath();
 		int LoadedMods = 0;
 		WIN32_FIND_DATAW Fd;
 		HANDLE Hf = FindFirstFileW(Utf8ToWide(JoinPath(ModsDir, "*.dmod")).c_str(), &Fd);
@@ -249,10 +257,34 @@ namespace
 		return !PathExists(Dir);
 	}
 
-	void WorkerCleanSrc()
+	void WorkerCleanCache()
 	{
 		SetBusy(true);
-		std::string SrcDir = JoinPath(g_Installer.AppDir, "src");
+		const std::string Src = SrcDirPath();
+		const std::string Down = DownloadingDirPath();
+
+		// ① downloading：全是没下完的残缺文件，直接删（不进回收站）
+		if(PathExists(Down))
+		{
+			uint64_t Db = DirSizeBytes(Down);
+			LogBridge(LogLevel::Info, "正在清理下载缓存（downloading\\ 里的残缺文件直接删除）…");
+			bool Dok = RemoveTree(Down);
+			MakeDirs(Down);
+			char DBuf[64];
+			snprintf(DBuf, sizeof(DBuf), "%.2f MB", Db / 1048576.0);
+			if(Dok)
+				LogBridge(LogLevel::Info, std::string("已删除下载缓存 downloading\\（") + DBuf + "）");
+			else
+				LogBridge(LogLevel::Warn, "删除 downloading\\ 没删干净（可能有文件被占用，可关闭占用程序后再点一次）");
+		}
+		else
+		{
+			MakeDirs(Down);
+			LogBridge(LogLevel::Info, "downloading\\ 不存在或为空，没有可清理的下载缓存");
+		}
+
+		// ② src：源码与构建产物移到回收站（可恢复）
+		std::string SrcDir = Src;
 		if(!PathExists(SrcDir))
 		{
 			LogBridge(LogLevel::Info, "src\\ 不存在，没有可清理的内容");
@@ -313,8 +345,23 @@ namespace
 			std::wstring Ver = Utf8ToWide(M.Version.empty() ? "?" : M.Version);
 			ListView_SetItemText(g_hModules, (int)i, 1, &Ver[0]);
 
-			// 适配版本列：只显示最新的一档（列表顺序即优先级，取最后一条）；为空则显示"未声明"
-			std::string SupS = M.SupportedVersions.empty() ? std::string("未声明") : M.SupportedVersions.back();
+			// 适配版本列：每个来源只显示其最新的一档（列表顺序即优先级，同来源取最后一条）
+			std::string SupS;
+			{
+				std::map<std::string, std::string> Latest;
+				for(const auto &S : M.SupportedVersions)
+				{
+					const size_t At = S.find('@');
+					if(At == std::string::npos)
+						Latest[S] = S;      // 只写了版本或来源 id，原样保留
+					else
+						Latest[S.substr(0, At)] = S.substr(At + 1);
+				}
+				for(const auto &KV : Latest)
+					SupS += (SupS.empty() ? "" : "、") + KV.first + "@" + KV.second;
+			}
+			if(SupS.empty())
+				SupS = "未声明";
 			std::wstring Sup = Utf8ToWide(SupS);
 			ListView_SetItemText(g_hModules, (int)i, 2, &Sup[0]);
 
@@ -533,8 +580,9 @@ namespace
 		LogBridge(LogLevel::Info, "网络：" + NetSummary());
 		InstallOptions Opt;
 		// 强制固定布局（用户不可选）：全部在本程序目录下
-		Opt.WorkDir = JoinPath(g_Installer.AppDir, "src");      // 拉取的源码 + 构建
-		Opt.ClientDir = JoinPath(g_Installer.AppDir, "client"); // 构建好的客户端
+		Opt.WorkDir = SrcDirPath();                 // 拉取的源码 + 构建
+		Opt.ClientDir = ClientDirPath();            // 构建好的客户端
+		Opt.DownloadingDir = DownloadingDirPath();  // 下载中转（正在下载的先放这里）
 		Opt.Source = SelectedSource();
 		int V = (int)SendMessageW(g_hVersions, LB_GETCURSEL, 0, 0);
 		if(V < 0 || V >= (int)g_Versions.size())
@@ -706,7 +754,7 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		g_hCancel = CreateWindowW(L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_CANCEL, nullptr, nullptr);
 		g_hUpdate = CreateWindowW(L"BUTTON", L"检查更新", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_UPDATE, nullptr, nullptr);
 		g_hOpenDir = CreateWindowW(L"BUTTON", L"打开安装目录", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_OPENDIR, nullptr, nullptr);
-		g_hClean = CreateWindowW(L"BUTTON", L"清理源码", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_CLEAN, nullptr, nullptr);
+		g_hClean = CreateWindowW(L"BUTTON", L"清理缓存", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_CLEAN, nullptr, nullptr);
 		g_hRefMods = CreateWindowW(L"BUTTON", L"刷新模块", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_REFMODS, nullptr, nullptr);
 		g_hReloadLog = CreateWindowW(L"BUTTON", L"刷新日志", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_RELOADLOG, nullptr, nullptr);
 		g_hProgress = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE | PBS_MARQUEE, 0, 0, 0, 0, H, (HMENU)(INT_PTR)IDC_PROGRESS, nullptr, nullptr);
@@ -755,15 +803,15 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		// ---- 启动自检：强制布局（只出一个 exe，三个目录首次运行时自动创建）----
 		{
 			AppendLog("[i] 自检：程序 " + ExeDir());
-			const char *apDirs[] = {"mods", "src", "client"};
-			const char *apWhy[] = {"存放 .dmod 模块", "存放拉取的源码与构建", "存放构建好的客户端"};
-			for(int i = 0; i < 3; ++i)
+			const char *apDirs[] = {"mods", "src", "ddnet-client", "downloading", "debug"};
+			const char *apWhy[] = {"存放 .dmod 模块", "存放拉取的源码与构建", "存放构建好的客户端", "下载中转（正在下载的先放这里）", "日志与安装记录"};
+			for(int i = 0; i < 5; ++i)
 			{
-				std::string P = JoinPath(ExeDir(), apDirs[i]);
+				std::string P = JoinPath(DataRoot(), apDirs[i]);
 				bool Existed = IsDir(P);
 				if(!Existed)
 					MakeDirs(P);
-				AppendLog(std::string("      ") + apDirs[i] + "\\ " + (Existed ? "已存在" : "已创建") + " —— " + apWhy[i] + "  " + P);
+				AppendLog(std::string("      .ddnet\\") + apDirs[i] + "\\ " + (Existed ? "已存在" : "已创建") + " —— " + apWhy[i] + "  " + P);
 			}
 			std::string ExePath = JoinPath(ExeDir(), "ddnet-module-installer.exe");
 			AppendLog(std::string("[i] 主程序：") + (PathExists(ExePath) ? "就位" : "文件名与预期不同（不影响使用）"));
@@ -773,7 +821,7 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		{
 			int LoadedMods = ScanModsFolder();
 			if(LoadedMods > 0)
-				AppendLog("[i] 已加载单文件 mod " + std::to_string(LoadedMods) + " 个（" + JoinPath(ExeDir(), "mods") + "\\*.dmod）");
+				AppendLog("[i] 已加载单文件 mod " + std::to_string(LoadedMods) + " 个（" + ModsDirPath() + "\\*.dmod）");
 			else
 				AppendLog("[i] 还没有单文件 mod —— 把 .dmod 文件直接拖进本窗口即可添加");
 		}
@@ -782,7 +830,7 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		FillModules();
 		StartWorker(WorkerRefresh);
 
-		g_HasState = InstallState::Load(JoinPath(JoinPath(ExeDir(), "debug"), "install-state.json"), g_State);
+		g_HasState = InstallState::Load(JoinPath(DebugDirPath(), "install-state.json"), g_State);
 		if(g_HasState)
 		{
 			AppendLog("[i] 检测到已安装记录：" + g_State.SourceId + " @" + g_State.Version + "（" + g_State.Timestamp + "）");
@@ -838,7 +886,7 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		if(Id == IDC_REFRESH)
 			StartWorker(WorkerRefresh);
 		else if(Id == IDC_CLEAN)
-			StartWorker(WorkerCleanSrc);
+			StartWorker(WorkerCleanCache);
 		else if(Id == IDC_REFMODS)
 		{
 			// 手动刷新 mods\：清掉来自 mods\ 的条目再重扫（modules.json 来的不受影响）
@@ -906,7 +954,7 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		}
 		else if(Id == IDC_OPENDIR)
 		{
-			std::string D = g_HasState && !g_State.DistDir.empty() ? g_State.DistDir : JoinPath(g_Installer.AppDir, "client");
+			std::string D = g_HasState && !g_State.DistDir.empty() ? g_State.DistDir : ClientDirPath();
 			ShellExecuteW(nullptr, L"open", Utf8ToWide(D).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 		}
 		else if(Id == IDC_SOURCE && HIWORD(W) == CBN_SELCHANGE)
@@ -917,8 +965,8 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		HDROP Drop = (HDROP)W;
 		UINT Count = DragQueryFileW(Drop, 0xFFFFFFFF, nullptr, 0);
 		int Added = 0;
-		std::string ModsDir = JoinPath(g_Installer.AppDir, "mods");
-		std::string CacheDir = JoinPath(JoinPath(g_Installer.AppDir, "src"), "_mods");
+		std::string ModsDir = ModsDirPath();
+		std::string CacheDir = ModCacheDirPath();
 		MakeDirs(ModsDir);
 		for(UINT i = 0; i < Count; ++i)
 		{
@@ -1045,9 +1093,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
 	g_Installer.pCancel = &g_CancelFlag;
 	g_Installer.Net.pCancel = &g_CancelFlag;
 	g_Installer.AppDir = ExeDir();
-	// 日志与安装记录统一放在 debug 子目录，程序根目录只留 mods / src / client
-	MakeDirs(JoinPath(g_Installer.AppDir, "debug"));
-	g_LogFile = JoinPath(JoinPath(g_Installer.AppDir, "debug"), "installer.log");
+	// 日志与安装记录统一放在 .ddnet\debug 子目录
+	MakeDirs(DebugDirPath());
+	g_LogFile = JoinPath(DebugDirPath(), "installer.log");
 	{
 		FILE *F = nullptr;
 		if(fopen_s(&F, g_LogFile.c_str(), "wb") == 0 && F)

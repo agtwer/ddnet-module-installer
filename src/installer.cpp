@@ -284,8 +284,11 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		Log(LogLevel::Info, std::string("  下载线程：") + (Opt.DownloadThreads > 1
 									  ? std::to_string(Opt.DownloadThreads) + "（HTTP Range 分段多连接）"
 									  : "1（单连接）"));
-	const std::string WorkDir0 = Opt.WorkDir.empty() ? JoinPath(AppDir, "src") : Opt.WorkDir;
-	const std::string ClientDir0 = Opt.ClientDir.empty() ? JoinPath(AppDir, "client") : Opt.ClientDir;
+	const std::string WorkDir0 = Opt.WorkDir.empty() ? JoinPath(JoinPath(AppDir, ".ddnet"), "src") : Opt.WorkDir;
+	const std::string ClientDir0 = Opt.ClientDir.empty() ? JoinPath(JoinPath(AppDir, ".ddnet"), "ddnet-client") : Opt.ClientDir;
+	// 下载中转目录：正在下载的文件先落在这里，下完再移到 src（与"已完成的源码"分开）
+	const std::string DownDir0 = Opt.DownloadingDir.empty() ? JoinPath(JoinPath(AppDir, ".ddnet"), "downloading") : Opt.DownloadingDir;
+	MakeDirs(DownDir0);
 	if(WorkDir0.empty())
 	{
 		Error = "未设置安装/工作目录";
@@ -331,6 +334,10 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		}
 		// ② FFmpeg 包：能正常解压就留下（下次直接跳过下载），否则删掉重下
 		std::string Zip = JoinPath(WorkDir0, "ffmpeg-8.1.zip");
+		// 下载中途的半成品在 downloading 里（名字带 .part），不算"已完成的包"
+		std::string ZipPart = JoinPath(DownDir0, "ffmpeg-8.1.zip.part");
+		if(PathExists(ZipPart))
+			Kill(ZipPart);
 		if(PathExists(Zip))
 		{
 			std::string Fx = JoinPath(WorkDir0, "_ffcheck");
@@ -372,6 +379,36 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		// ④ 补丁临时文件是本次产物，照删
 		for(const auto &M : Opt.Modules)
 			Kill(JoinPath(WorkDir0, M.Id + ".patch"));
+		// ⑤ downloading 里全是没下完的残缺文件（正在下载的副本），一律直接删掉
+		{
+			std::string Down = Opt.DownloadingDir.empty() ? JoinPath(JoinPath(AppDir, ".ddnet"), "downloading") : Opt.DownloadingDir;
+			if(PathExists(Down))
+			{
+				int OldKilled = (int)Killed.size();
+				std::vector<std::string> DownDirs{Down};
+				while(!DownDirs.empty())
+				{
+					std::string D = DownDirs.back();
+					DownDirs.pop_back();
+					WIN32_FIND_DATAW F3;
+					HANDLE H3 = FindFirstFileW(Utf8ToWide(JoinPath(D, "*")).c_str(), &F3);
+					if(H3 == INVALID_HANDLE_VALUE)
+						continue;
+					do {
+						std::string N = WideToUtf8(F3.cFileName);
+						if(N == "." || N == "..")
+							continue;
+						if(F3.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+							DownDirs.push_back(JoinPath(D, N));
+						else
+							Kill(JoinPath(D, N));
+					} while(FindNextFileW(H3, &F3));
+					FindClose(H3);
+				}
+				if((int)Killed.size() > OldKilled)
+					Log(LogLevel::Info, "    已删除 downloading\\ 里未下载完的残缺文件");
+			}
+		}
 		// 若 _work 已空就一起收掉，别留空目录
 		{
 			WIN32_FIND_DATAW Fd;
@@ -673,10 +710,23 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 					}
 				}
 				if(RejCount == 0)
+				{
 					LogAt(LogLevel::Info, "  补丁已全部套用（逐 hunk 成功，无 .rej 残留）");
+				}
 				else
-					LogAt(LogLevel::Warn, "  有 " + std::to_string(RejCount) + " 个 hunk 没套上（首个：" + FirstRej + "），"
-						"请按模块文档的锚点表手工处理 .rej 文件");
+				{
+					// 有 hunk 没套上 = 这个模块大概率没适配当前所选的版本。
+					// 以前这里只打个警告就继续往下编译，结果编译报"缺 Rust/CMake"之类的误导错误。
+					// 现在直接中止，并把"模块 ↔ 版本"这个真实原因说清楚。
+					LogAt(LogLevel::Error, "  有 " + std::to_string(RejCount) + " 处补丁没套上（首个：" + FirstRej + "）");
+					std::string Sup;
+					for(size_t k = 0; k < M.SupportedVersions.size(); ++k)
+						Sup += (k ? "、" : "") + M.SupportedVersions[k];
+					Error = "模块 " + M.Id + " 没有适配 " + Opt.Source.Name + " " + Opt.Version.Ref
+						+ "（补丁有 " + std::to_string(RejCount) + " 处套不上，已中止，不会继续编译）"
+						+ (Sup.empty() ? std::string("") : ("；该模块已适配：" + Sup));
+					return false;
+				}
 				if(!A2.Ok() && PathExists(JoinPath(Tree, "CMakeLists.txt")) == false)
 				{
 					Error = "补丁套用失败且源码树异常";
@@ -728,6 +778,9 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		std::string Zip = Opt.FfmpegZip;
 		if(Zip.empty())
 			Zip = JoinPath(WorkDir0, "ffmpeg-8.1.zip");
+		// 下载先落到 downloading（半成品），下完再移进 src —— 这样"正在下载"和"已完成的源码"分开，
+		// 意外退出只会留下 downloading 里的残缺文件，不会污染 src 里可复用的包。
+		const std::string ZipPart = JoinPath(DownDir0, "ffmpeg-8.1.zip.part");
 		// 解压即验证：多线程下载把文件**预分配到最终大小**再并行写分段，进程被杀/崩溃
 		// 会留下"尺寸正常、内容半截"的坏 zip（tar -t 只查目录测不出分段缺失），直接复用
 		// 必然在解压时炸。所以"解压"本身就是验证：失败就删掉重下一次（用户要求中断不残留）。
@@ -746,7 +799,7 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 				Report(60, "下载 FFmpeg 8.1：" + ShowUrl);
 				int64_t LastBytes = 0;
 				auto LastT = std::chrono::steady_clock::now();
-				HttpResult D = Download(Url, Zip, [&](int64_t Got, int64_t Total) {
+				HttpResult D = Download(Url, ZipPart, [&](int64_t Got, int64_t Total) {
 					auto Now = std::chrono::steady_clock::now();
 					double Dt = std::chrono::duration<double>(Now - LastT).count();
 					if(Dt < 0.5)
@@ -777,10 +830,23 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 					LogAt(LogLevel::Warn, "  FFmpeg 下载失败：" + D.Error + "（不影响图片背景，视频会不可用；可从 BtbN/FFmpeg-Builds 手动下载后重试）");
 					break;
 				}
+				// 下载完成：从 downloading 移到 src（此时才算"可复用的前置依赖"）
+				if(PathExists(ZipPart))
+				{
+					DeleteFileW(Utf8ToWide(Zip).c_str());
+					if(MoveFileW(Utf8ToWide(ZipPart).c_str(), Utf8ToWide(Zip).c_str()) == 0)
+					{
+						// 移动失败就退化为复制，保证流程能继续
+						if(!CopyFileW(Utf8ToWide(ZipPart).c_str(), Utf8ToWide(Zip).c_str(), FALSE))
+							LogAt(LogLevel::Warn, "  下载完成但移入 src 失败，将直接使用 downloading 里的副本");
+						else
+							DeleteFileW(Utf8ToWide(ZipPart).c_str());
+					}
+				}
 			}
 			RemoveTree(Ex);
 			MakeDirs(Ex);
-			ProcessResult T = Do("tar", {"-xf", Zip, "-C", Ex}, "");
+			ProcessResult T = Do("tar", {"-xf", PathExists(Zip) ? Zip : ZipPart, "-C", Ex}, "");
 			if(T.Ok())
 			{
 				FfmpegInstalled = true;
@@ -973,7 +1039,7 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 				Error = "用户已取消（本次下载已自动清理）";
 				return false;
 			}
-			Error = "编译失败（看日志最后几行；常见：缺 Rust/CMake 版本过低）";
+			Error = "编译失败（看日志最后几行；常见：缺 Rust/CMake 版本过低；若日志里有'不是 CConfig 的成员'/'不是 ... 的成员'这类，多半是模块补丁没适配该版本）";
 			return false;
 		}
 		InCompile = false;

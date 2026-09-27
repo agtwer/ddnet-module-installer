@@ -16,7 +16,7 @@ enum class LogLevel { Info, Step, Warn, Error, Raw };
 using LogFn = std::function<void(LogLevel, const std::string &)>;
 
 // 程序版本号（安装器自身；模块各自有自己的 tested_on/verified 信息）
-inline const char *kInstallerVersion = "1.2";
+inline const char *kInstallerVersion = "1.3";
 
 // ------------------------------------------------------------------- http ---
 struct HttpResult
@@ -167,8 +167,9 @@ struct InstallState
 // ----------------------------------------------------------------- install ---
 struct InstallOptions
 {
-	std::string WorkDir;          // 源码与构建所在目录（默认 <根>\_work）
-	std::string ClientDir;        // 最终可运行客户端目录（默认 <根>\Client，照 DDNet 默认结构）
+	std::string WorkDir;          // 源码与构建所在目录（默认 <根>/.ddnet/src）
+	std::string ClientDir;        // 最终可运行客户端目录（默认 <根>/.ddnet/ddnet-client）
+	std::string DownloadingDir;   // 下载中转目录（默认 <根>/.ddnet/downloading）：正在下载的先放这里，完成后移到 WorkDir
 	GameSource Source;
 	GameVersion Version;
 	std::vector<ModuleInfo> Modules;
