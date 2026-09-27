@@ -313,12 +313,8 @@ namespace
 			std::wstring Ver = Utf8ToWide(M.Version.empty() ? "?" : M.Version);
 			ListView_SetItemText(g_hModules, (int)i, 1, &Ver[0]);
 
-			// 适配版本列：列出该模块做过适配的"来源@版本"；为空则显示"未声明"
-			std::string SupS;
-			for(size_t k = 0; k < M.SupportedVersions.size(); ++k)
-				SupS += (k ? "、" : "") + M.SupportedVersions[k];
-			if(SupS.empty())
-				SupS = "未声明";
+			// 适配版本列：只显示最新的一档（列表顺序即优先级，取最后一条）；为空则显示"未声明"
+			std::string SupS = M.SupportedVersions.empty() ? std::string("未声明") : M.SupportedVersions.back();
 			std::wstring Sup = Utf8ToWide(SupS);
 			ListView_SetItemText(g_hModules, (int)i, 2, &Sup[0]);
 
