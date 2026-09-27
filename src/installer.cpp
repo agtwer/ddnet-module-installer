@@ -81,13 +81,32 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			return Net.DownloadFile(Url, Dest, Cb);
 		};
 		HttpResult R = Once();
-		if(!R.Ok && !Net.Direct)
+		// 至少重试三次并**轮换网络策略**（镜像 / 代理 / 直连都试过），全部失败才算真失败。
+		int Attempt = 0;
+		while(!R.Ok && Attempt < 3)
 		{
-			LogAt(LogLevel::Warn, "  下载失败（" + R.Error + "；" + (Net.Proxy.empty() ? "当前按系统代理设置走" : "当前代理 " + Net.Proxy) +
-						      "）——绕过所有代理直连重试一次");
-			Net.Proxy.clear();
-			Net.Direct = true;
-			GitProxy = false;
+			++Attempt;
+			std::string How;
+			if(!Net.MirrorPrefix.empty())
+			{
+				Net.MirrorPrefix.clear();       // 上一次走了镜像 → 这次去掉镜像
+				How = "去掉镜像";
+			}
+			else if(!Net.Proxy.empty() && !Net.Direct)
+			{
+				Net.Proxy.clear();              // 上一次走了代理 → 这次绕过所有代理直连
+				Net.Direct = true;
+				GitProxy = false;
+				How = "绕过所有代理直连";
+			}
+			else
+			{
+				Net.Direct = false;             // 上一次是直连 → 这次换回显式代理
+				Net.Proxy = Opt.Proxy;
+				GitProxy = !Opt.Proxy.empty();
+				How = Opt.Proxy.empty() ? "恢复按系统代理设置走" : ("改用代理 " + Opt.Proxy);
+			}
+			LogAt(LogLevel::Warn, "  下载失败（" + R.Error + "）——第 " + std::to_string(Attempt) + " 次重试：" + How);
 			R = Once();
 		}
 		return R;
@@ -805,8 +824,11 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 		// 会留下"尺寸正常、内容半截"的坏 zip（tar -t 只查目录测不出分段缺失），直接复用
 		// 必然在解压时炸。所以"解压"本身就是验证：失败就删掉重下一次（用户要求中断不残留）。
 		std::string Ex = JoinPath(WorkDir0, "ffmpeg-extract");
-		for(int Attempt = 0; Attempt < 2 && !FfmpegInstalled; ++Attempt)
+		// 至少尝试三次（每次内部还会轮换网络策略重试），全部失败则取消安装
+		for(int Attempt = 0; Attempt < 3 && !FfmpegInstalled; ++Attempt)
 		{
+			if(Attempt > 0)
+				LogAt(LogLevel::Info, "  第 " + std::to_string(Attempt + 1) + " 次尝试下载 FFmpeg 8.1…");
 			if(!PathExists(Zip))
 			{
 				std::string Url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip";
@@ -847,8 +869,17 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 						Error = "用户已取消（本次下载已自动清理）";
 						return false;
 					}
-					LogAt(LogLevel::Warn, "  FFmpeg 下载失败：" + D.Error + "（不影响图片背景，视频会不可用；可从 BtbN/FFmpeg-Builds 手动下载后重试）");
-					break;
+					if(Attempt + 1 < 3)
+					{
+						LogAt(LogLevel::Warn, "  第 " + std::to_string(Attempt + 1) + " 次下载失败（" + D.Error + "），准备重试…");
+						continue;   // 还有次数：进入下一轮尝试
+					}
+					// 三次都失败：FFmpeg 是模块声明的必需依赖 → 取消安装并清理
+					LogAt(LogLevel::Error, "  FFmpeg 下载失败（已尝试三次并轮换全部网络策略）：" + D.Error);
+					CleanupPartial();
+					Error = "取消安装：FFmpeg 8.1 下载失败（已重试三次：镜像/代理/直连都试过）。"
+						"可手动下载后放到 " + Zip + " 再重试，或取消勾选需要视频的模块";
+					return false;
 				}
 				// 下载完成：从 downloading 移到 src（此时才算"可复用的前置依赖"）
 				if(PathExists(ZipPart))
@@ -1036,6 +1067,9 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 			if(!C.Ok())
 			{
 				Error = "CMake 配置失败（重试后仍失败；检查 MSVC/CMake 是否可用，日志里有详细错误）";
+				if(!Dist.empty())
+					RemoveTree(Dist);
+				CleanupPartial();
 				return false;
 			}
 		}
@@ -1060,6 +1094,10 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 				return false;
 			}
 			Error = "编译失败（看日志最后几行；常见：缺 Rust/CMake 版本过低；若日志里有'不是 CConfig 的成员'/'不是 ... 的成员'这类，多半是模块补丁没适配该版本）";
+			// 安装失败：清理本次产生的文件（含已组装出的残缺 client 目录）
+			if(!Dist.empty())
+				RemoveTree(Dist);
+			CleanupPartial();
 			return false;
 		}
 		InCompile = false;
@@ -1165,6 +1203,10 @@ bool Installer::Run(const InstallOptions &Opt, InstallState &OutState, std::stri
 					LogAt(LogLevel::Error, "  完整性校验失败：client\\ 缺少运行时 DLL：" + Miss);
 					Error = "完整性校验失败：缺少运行时 DLL：" + Miss;
 				}
+				// 安装失败：清理本次产生的文件（含残缺的 client 目录）
+				if(!Dist.empty())
+					RemoveTree(Dist);
+				CleanupPartial();
 				return false;
 			}
 			LogAt(LogLevel::Info, "  完整性校验通过：DDNet.exe 的 DLL 依赖全部就绪");

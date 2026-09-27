@@ -31,6 +31,7 @@ namespace
 	const UINT WM_APP_DONE = WM_APP + 2;
 	const UINT WM_APP_PROGRESS = WM_APP + 3;
 	const UINT WM_APP_BUSY = WM_APP + 4;
+	const UINT WM_APP_SCROLLLOG = WM_APP + 5;   // 日志刷新后延后滚到最下面
 
 	std::atomic<bool> g_CancelFlag{false};
 	HWND g_hProgText;
@@ -111,8 +112,10 @@ namespace
 			Text = "[… 只显示日志末尾部分，完整内容见 debug\\installer.log]\r\n" + Text.substr(Cut);
 		}
 		SetWindowTextW(g_hLog, Utf8ToWide(Text).c_str());
-		SendMessageW(g_hLog, EM_SETSEL, -1, -1);
-		SendMessageW(g_hLog, EM_SCROLLCARET, 0, 0);
+		// 停留在最下面（最新内容）。注意：SetWindowTextW 会把滚动位置重置回顶部，而且
+		// 紧接着发滚动消息往往被随后的重绘抵消（实测 EM_LINESCROLL / WM_VSCROLL 都无效）。
+		// 所以改为**延后一拍**：PostMessage 到主线程，等这次 SetWindowText 完成后再滚。
+		PostMessageW(g_hMain, WM_APP_SCROLLLOG, 0, 0);
 	}
 
 	void LogBridge(LogLevel Lv, const std::string &S)
@@ -257,51 +260,80 @@ namespace
 		return !PathExists(Dir);
 	}
 
+	// 列出目录下的一级子项（文件与子目录），不含 . 与 ..
+	std::vector<std::string> ListChildren(const std::string &Dir)
+	{
+		std::vector<std::string> Out;
+		WIN32_FIND_DATAW Fd;
+		HANDLE H = FindFirstFileW(Utf8ToWide(JoinPath(Dir, "*")).c_str(), &Fd);
+		if(H == INVALID_HANDLE_VALUE)
+			return Out;
+		do {
+			std::string N = WideToUtf8(Fd.cFileName);
+			if(N == "." || N == "..")
+				continue;
+			Out.push_back(JoinPath(Dir, N));
+		} while(FindNextFileW(H, &Fd));
+		FindClose(H);
+		return Out;
+	}
+
 	void WorkerCleanCache()
 	{
 		SetBusy(true);
 		const std::string Src = SrcDirPath();
 		const std::string Down = DownloadingDirPath();
+		MakeDirs(Src);
+		MakeDirs(Down);
 
-		// ① downloading：全是没下完的残缺文件，直接删（不进回收站）
-		if(PathExists(Down))
+		// ① downloading：里面的东西一律是没下完的残缺文件 → **逐个**直接删（不进回收站）。
+		//    只动文件夹里的内容，downloading 文件夹本身保留。
 		{
 			uint64_t Db = DirSizeBytes(Down);
-			LogBridge(LogLevel::Info, "正在清理下载缓存（downloading\\ 里的残缺文件直接删除）…");
-			bool Dok = RemoveTree(Down);
-			MakeDirs(Down);
+			std::vector<std::string> Items = ListChildren(Down);
 			char DBuf[64];
 			snprintf(DBuf, sizeof(DBuf), "%.2f MB", Db / 1048576.0);
-			if(Dok)
-				LogBridge(LogLevel::Info, std::string("已删除下载缓存 downloading\\（") + DBuf + "）");
+			if(Items.empty())
+				LogBridge(LogLevel::Info, "downloading\\ 里没有可清理的内容");
 			else
-				LogBridge(LogLevel::Warn, "删除 downloading\\ 没删干净（可能有文件被占用，可关闭占用程序后再点一次）");
-		}
-		else
-		{
-			MakeDirs(Down);
-			LogBridge(LogLevel::Info, "downloading\\ 不存在或为空，没有可清理的下载缓存");
+			{
+				LogBridge(LogLevel::Info, "正在清理下载缓存（逐个删除 downloading\\ 里的残缺文件，文件夹保留）…");
+				int FailedN = 0;
+				for(const auto &P : Items)
+					if(!RemoveTree(P))
+						FailedN++;
+				if(FailedN == 0)
+					LogBridge(LogLevel::Info, "已清空 downloading\\ 里的 " + std::to_string(Items.size()) + " 项（" + DBuf + "）；文件夹保留");
+				else
+					LogBridge(LogLevel::Warn, "downloading\\ 里有 " + std::to_string(FailedN) + " 项没能删掉（可能被占用，可关闭占用程序后再点一次）");
+			}
 		}
 
-		// ② src：源码与构建产物移到回收站（可恢复）
-		std::string SrcDir = Src;
-		if(!PathExists(SrcDir))
+		// ② src：源码与构建产物**逐个**移到回收站（可恢复）。
+		//    只动文件夹里的内容，src 文件夹本身保留 —— 不整个搬走。
 		{
-			LogBridge(LogLevel::Info, "src\\ 不存在，没有可清理的内容");
-			PostMessageW(g_hMain, WM_APP_DONE, 3, 0);
-			return;
+			uint64_t Bytes = DirSizeBytes(Src);
+			std::vector<std::string> Items = ListChildren(Src);
+			char Buf[64];
+			snprintf(Buf, sizeof(Buf), "%.2f GB", Bytes / 1073741824.0);
+			if(Items.empty())
+				LogBridge(LogLevel::Info, "src\\ 里没有可清理的内容");
+			else
+			{
+				LogBridge(LogLevel::Info, "正在清理源码与构建产物（逐个移到回收站，可恢复；文件很多，可能要几秒到几十秒）…");
+				int FailedN = 0;
+				for(const auto &P : Items)
+				{
+					std::string RErr;
+					if(!MoveToRecycleBin(P, RErr))
+						FailedN++;
+				}
+				if(FailedN == 0)
+					LogBridge(LogLevel::Info, "已把 src\\ 里的 " + std::to_string(Items.size()) + " 项移到回收站（释放约 " + Buf + "）；src 文件夹保留，下次安装会重新克隆");
+				else
+					LogBridge(LogLevel::Error, "src\\ 里有 " + std::to_string(FailedN) + " 项没能移到回收站（可能被占用，可关闭占用程序后再点一次）");
+			}
 		}
-		LogBridge(LogLevel::Info, "正在清理源码与构建产物（移到回收站，可恢复；文件很多，可能要几秒到几十秒）…");
-		uint64_t Bytes = DirSizeBytes(SrcDir);
-		char Buf[64];
-		snprintf(Buf, sizeof(Buf), "%.2f GB", Bytes / 1073741824.0);
-		std::string RErr;
-		bool Ok = MoveToRecycleBin(SrcDir, RErr);
-		MakeDirs(SrcDir);   // 目录保留（固定布局：src\ 由安装流程继续使用）
-		if(Ok)
-			LogBridge(LogLevel::Info, std::string("已把 src\\ 移到回收站（释放约 ") + Buf + "，可从回收站恢复）；下次安装会重新克隆");
-		else
-			LogBridge(LogLevel::Error, "移入回收站失败（" + RErr + "）；可能有文件被占用，可关闭占用程序后再点一次");
 		PostMessageW(g_hMain, WM_APP_DONE, 3, 0);
 	}
 
@@ -622,16 +654,18 @@ namespace
 
 		std::string Err;
 		bool Ok = g_Installer.Run(Opt, g_State, Err);
+		int DoneCode = 3;   // 3 = 安装结束（默认）
 		if(Ok)
 		{
 			g_HasState = true;
 			LogBridge(LogLevel::Info, "全部完成 ✔");
+			DoneCode = 4;   // 4 = 安装成功结束 → 主线程会自动刷新一次日志
 		}
 		else if(g_CancelFlag.load())
 			LogBridge(LogLevel::Warn, "已取消：本次下载与构建产物已自动清理（下次安装需重新下载）");
 		else
 			LogBridge(LogLevel::Error, "安装中断：" + Err);
-		PostMessageW(g_hMain, WM_APP_DONE, 3, 0);
+		PostMessageW(g_hMain, WM_APP_DONE, DoneCode, 0);
 	}
 
 	void StartWorker(void (*Fn)())
@@ -877,7 +911,28 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		SendMessageW(g_hProgress, PBM_SETPOS, 100, 0);
 		if(W == 1)
 			FillVersions();
+		if(W == 4)
+		{
+			// 安装完成后自动刷新一次日志（日志文件是权威来源，能补上界面可能漏掉的尾部），
+			// 并且必须**停在最下面**（最新内容）——ReloadLogFromFile 内部已保证滚到底。
+			ReloadLogFromFile();
+		}
 		SetStatus("就绪");
+		return 0;
+	}
+	case WM_APP_SCROLLLOG: {
+		// 日志刷新（SetWindowText）完成后滚到最下面：先取总行数，再用 EM_LINESCROLL
+		// 显式下滚，并用 WM_VSCROLL(SB_BOTTOM) 兜底。
+		const int Lines = (int)SendMessageW(g_hLog, EM_GETLINECOUNT, 0, 0);
+		if(Lines > 1)
+		{
+			SendMessageW(g_hLog, EM_LINESCROLL, 0, (LPARAM)Lines);
+			SendMessageW(g_hLog, WM_VSCROLL, SB_BOTTOM, 0);
+		}
+		const int Len = GetWindowTextLengthW(g_hLog);
+		SendMessageW(g_hLog, EM_SETSEL, Len, Len);
+		SendMessageW(g_hLog, EM_SCROLLCARET, 0, 0);
+		UpdateWindow(g_hLog);
 		return 0;
 	}
 	case WM_COMMAND: {
@@ -954,8 +1009,24 @@ LRESULT CALLBACK WndProc(HWND H, UINT Msg, WPARAM W, LPARAM L)
 		}
 		else if(Id == IDC_OPENDIR)
 		{
-			std::string D = g_HasState && !g_State.DistDir.empty() ? g_State.DistDir : ClientDirPath();
-			ShellExecuteW(nullptr, L"open", Utf8ToWide(D).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+			// 路径要有"存在性回退"：上次安装记录的成品目录可能已过时（旧版 client\、
+			// 或用户搬过目录），直接 ShellExecute 会静默失败 → 看起来像按钮坏了。
+			// 顺序：上次的成品目录（存在才用）→ .ddnet\ddnet-client → .ddnet 根目录。
+			std::string D;
+			if(g_HasState && !g_State.DistDir.empty() && IsDir(g_State.DistDir))
+				D = g_State.DistDir;
+			else
+			{
+				D = ClientDirPath();
+				if(!IsDir(D))
+					D = DataRoot();
+			}
+			MakeDirs(D);
+			HINSTANCE R = ShellExecuteW(nullptr, L"open", Utf8ToWide(D).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+			if((INT_PTR)R <= 32)
+				AppendLog("[x] 打开目录失败（路径不存在或没有权限）：" + D);
+			else
+				AppendLog("[i] 已打开：" + D);
 		}
 		else if(Id == IDC_SOURCE && HIWORD(W) == CBN_SELCHANGE)
 			StartWorker(WorkerRefresh);
