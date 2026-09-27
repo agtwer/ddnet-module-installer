@@ -16,7 +16,7 @@ enum class LogLevel { Info, Step, Warn, Error, Raw };
 using LogFn = std::function<void(LogLevel, const std::string &)>;
 
 // 程序版本号（安装器自身；模块各自有自己的 tested_on/verified 信息）
-inline const char *kInstallerVersion = "1.5";
+inline const char *kInstallerVersion = "1.6";
 
 // ------------------------------------------------------------------- http ---
 struct HttpResult

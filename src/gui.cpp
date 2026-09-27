@@ -491,6 +491,10 @@ namespace
 		const std::string Host = SelectedMirrorHost();
 		g_Installer.Net.MirrorPrefix = Host.empty() ? "" : ("https://" + Host + "/");
 		g_Installer.Net.Proxy = SelectedProxy();
+		// 关键：每次开工都从"用户当前设置"重新开始。
+		// 否则一旦某次请求回退过（回退会把 Direct 置 true 并清空 Proxy），
+		// 之后即使用户勾着代理也会被静默忽略 —— 表现为"我明明开着代理却每次都报错"。
+		g_Installer.Net.Direct = false;
 	}
 
 	bool CtlChecked(HWND H) { return SendMessageW(H, BM_GETCHECK, 0, 0) == BST_CHECKED; }

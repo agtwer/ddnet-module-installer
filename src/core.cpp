@@ -1483,12 +1483,16 @@ bool Installer::FetchVersions(const GameSource &Src, std::vector<GameVersion> &O
 	//  ② 镜像不支持 api.github.com（ghproxy.net 会 403）→ 去掉镜像再试
 	//  ③ 还是失败（常见：系统代理开着、出口 IP 被 GitHub 限流 403）→ 用 INTERNET_OPEN_TYPE_DIRECT
 	//     **绕过系统代理**再试一次。注意：只清空 Proxy 是没用的，PRECONFIG 仍会跟随系统代理。
+	// 镜像对 api.github.com 的支持情况只需判定一次：一旦发现不支持，本次拉取就不再走它，
+	// 也避免每次刷新都刷两条"镜像 403"警告（用户会误以为自己的网络/代理出问题了）。
+	bool MirrorBad = false;
 	auto ApiGet = [&](const std::string &Url) {
 		HttpResult R = Net.GetString(Url);
-		if(!R.Ok && !Net.MirrorPrefix.empty())
+		if(!R.Ok && !Net.MirrorPrefix.empty() && !MirrorBad)
 		{
+			MirrorBad = true;
 			if(Log)
-				Log(LogLevel::Warn, "  镜像 " + Net.MirrorPrefix + " 不支持该接口（" + R.Error + "），去掉镜像重试");
+				Log(LogLevel::Info, "  这个镜像不代理 api.github.com（" + R.Error + "）——本次改为不走镜像；换用支持 api 的镜像可避免这一步");
 			const std::string Saved = Net.MirrorPrefix;
 			Net.MirrorPrefix.clear();
 			R = Net.GetString(Url);
@@ -1498,14 +1502,23 @@ bool Installer::FetchVersions(const GameSource &Src, std::vector<GameVersion> &O
 		{
 			if(Log)
 			{
-				if(Net.Proxy.empty())
-					Log(LogLevel::Warn, "  仍失败（" + R.Error + "）——可能被 Windows 系统代理拦了（当前系统代理开着就会走它）；" + "本次改为绕过所有代理直连重试");
+				// 403 / 429 是 GitHub 接口限流（未登录 60 次/小时）——**与代理无关**，
+				// 以前这里一律说"可能被系统代理拦了/请确认代理软件在运行"，把用户带偏。
+				if(R.Status == 403 || R.Status == 429)
+					Log(LogLevel::Warn, "  GitHub 接口返回 HTTP " + std::to_string(R.Status) + "（未登录每小时 60 次的上限，或被出口 IP 限流）——这不是代理的问题；本次请求改为直连，若仍失败会自动改用 git 取版本");
+				else if(Net.Proxy.empty())
+					Log(LogLevel::Warn, "  仍失败（" + R.Error + "）——可能被 Windows 系统代理拦了（当前系统代理开着就会走它）；本次请求改为绕过所有代理直连重试");
 				else
-					Log(LogLevel::Warn, "  代理 " + Net.Proxy + " 不可用（" + R.Error + "）——请确认代理软件在运行、出口没被限流；本次改为绕过所有代理直连重试");
+					Log(LogLevel::Warn, "  经代理 " + Net.Proxy + " 失败（" + R.Error + "）——本次请求改为直连重试（不改动你勾选的代理设置；若直连也失败再确认代理软件是否在运行）");
 			}
+			// 回退只作用于"这一次请求"：临时直连，试完立即把用户设置还回去。
+			// 以前这里把 Proxy 清空、Direct 永久置 true，导致后续请求全部忽略用户勾的代理。
+			const std::string SavedProxy = Net.Proxy;
 			Net.Proxy.clear();
-			Net.Direct = true;   // 本次运行后续请求也一律直连
+			Net.Direct = true;
 			R = Net.GetString(Url);
+			Net.Proxy = SavedProxy;
+			Net.Direct = false;
 		}
 		return R;
 	};
@@ -1535,34 +1548,102 @@ bool Installer::FetchVersions(const GameSource &Src, std::vector<GameVersion> &O
 	}
 	if(Out.empty())
 	{
-		// 退路：tags API
+		// 退路：tags API。若 releases 已经明确是限流（403/429），tags 必然同样被限，
+		// 再发一次请求只会白白消耗配额并多刷一条警告 —— 直接跳到下面的 git 兜底。
+		const bool ReleasesRateLimited = (R.Status == 403 || R.Status == 429);
+		if(ReleasesRateLimited)
+		{
+			if(Log)
+				Log(LogLevel::Info, "  releases 已被限流（HTTP " + std::to_string(R.Status) + "），跳过 tags 接口以免继续消耗配额");
+			Error = "GitHub 接口限流（HTTP " + std::to_string(R.Status) + "，未登录每小时 60 次；稍后再试即可，与代理无关）";
+		}
+		else
+		{
 		std::string TagsApi = "https://api.github.com/repos/" + Src.Repo + "/tags?per_page=30";
 		HttpResult T = ApiGet(TagsApi);
 		if(!T.Ok)
 		{
-			Error = R.Ok ? "releases 为空且 tags 获取失败" : ("无法获取版本信息: " + R.Error);
-			return false;
+			// 403 / 429 = GitHub 接口限流（未登录只有 60 次/小时），**不是代理坏了**。
+			// 以前这里只报"tags 获取失败"，界面又提示"请确认代理软件在运行"，把用户引偏。
+			const int St = (T.Status == 403 || T.Status == 429) ? T.Status : R.Status;
+			if(St == 403 || St == 429)
+				Error = "GitHub 接口限流（HTTP " + std::to_string(St) + "，未登录每小时 60 次；稍后再试即可，与代理无关）";
+			else
+				Error = R.Ok ? "releases 为空且 tags 获取失败" : ("无法获取版本信息: " + R.Error);
+			// 注意：这里不直接失败 —— 下面还有 git 兜底
 		}
-		JsonValue Root;
-		std::string Err;
-		if(!JsonParse(T.Body, Root, Err) || Root.T != JsonValue::Type::Array)
+		else
 		{
-			Error = "版本 JSON 解析失败: " + Err;
-			return false;
+			JsonValue Root;
+			std::string Err;
+			if(!JsonParse(T.Body, Root, Err) || Root.T != JsonValue::Type::Array)
+			{
+				Error = "版本 JSON 解析失败: " + Err;
+				return false;
+			}
+			for(const auto &Tag : Root.Arr)
+			{
+				GameVersion V;
+				V.Tag = Tag.GetString("name");
+				V.Name = V.Tag;
+				V.Ref = V.Tag;
+				if(!V.Tag.empty())
+					Out.push_back(V);
+			}
 		}
-		for(const auto &Tag : Root.Arr)
-		{
-			GameVersion V;
-			V.Tag = Tag.GetString("name");
-			V.Name = V.Tag;
-			V.Ref = V.Tag;
-			if(!V.Tag.empty())
-				Out.push_back(V);
-		}
+		}   // 结束"tags API"分支
 	}
 	if(Out.empty())
 	{
-		Error = "没有拿到任何版本（仓库可能没有 release/tag，或网络被拦）";
+		// 兜底：改用 git 协议直接读标签。GitHub API 未登录只有 60 次/小时，
+		// 被限流（HTTP 403）时这条路**不消耗 API 配额**，用户照样能选版本。
+		std::vector<std::string> GitArgs = {"-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=45"};
+		if(!Net.MirrorPrefix.empty())
+			GitArgs.insert(GitArgs.end(), {"-c", "url." + Net.MirrorPrefix + "https://github.com/.insteadOf=https://github.com/"});
+		if(!Net.Proxy.empty() && !Net.Direct)
+			GitArgs.insert(GitArgs.end(), {"-c", "http.proxy=http://" + Net.Proxy, "-c", "https.proxy=http://" + Net.Proxy});
+		GitArgs.push_back("ls-remote");
+		GitArgs.push_back("--tags");
+		GitArgs.push_back("--refs");
+		GitArgs.push_back("https://github.com/" + Src.Repo + ".git");
+		if(Log)
+			Log(LogLevel::Info, "  API 没拿到版本 —— 改用 git 读取标签（不消耗 API 配额）…");
+		ProcessResult G = RunProcess("git", GitArgs, "", nullptr);
+		if(G.Ok())
+		{
+			// 每行形如：<sha>\trefs/tags/<tag>
+			std::istringstream Is(G.Output);
+			std::string Line;
+			while(std::getline(Is, Line))
+			{
+				while(!Line.empty() && (Line.back() == '\r' || Line.back() == ' ' || Line.back() == '\t'))
+					Line.pop_back();
+				const size_t Tab = Line.find('\t');
+				if(Tab == std::string::npos)
+					continue;
+				const std::string RefName = Line.substr(Tab + 1);
+				const std::string Prefix = "refs/tags/";
+				if(RefName.rfind(Prefix, 0) != 0)
+					continue;
+				std::string Tag = RefName.substr(Prefix.size());
+				if(Tag.empty() || Tag.find("^{}") != std::string::npos)
+					continue;
+				GameVersion V;
+				V.Tag = Tag;
+				V.Name = Tag;
+				V.Ref = Tag;
+				Out.push_back(V);
+			}
+			if(!Out.empty() && Log)
+				Log(LogLevel::Info, "  已用 git 读取到 " + std::to_string(Out.size()) + " 个标签");
+		}
+		else if(Log)
+			Log(LogLevel::Warn, "  git 读取标签也失败（" + std::to_string(G.ExitCode) + "）");
+	}
+	if(Out.empty())
+	{
+		if(Error.empty())
+			Error = "没有拿到任何版本（仓库可能没有 release/tag，或网络被拦）";
 		return false;
 	}
 	return true;
